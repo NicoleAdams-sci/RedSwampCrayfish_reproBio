@@ -1,0 +1,1385 @@
+---
+title: "RSC_processing2022"
+author: "Nicole Adams"
+date: '2022-06-21'
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+# Seq processesing for 2022 sequencing run of Red Swamp Crayfish
+Samples were sequenced at MSU's RTSF Genomics Core, project ID ADA12634 (RSC_novaSeq_2022). We submitted a single pool made up of 24 Illumina compatible libraries. The pool was QC’d and quantified using a combination of Qubit dsDNA HS, Agilent 4200 TapeStation HS DNA1000 and Invitrogen Collibri Library Quantification qPCR assays. The pool was loaded onto one (1) lane of a NovaSeq S4 flow cell and sequencing performed in a 2x150bp paired end read format using a NovaSeq 6000 v1.5 300 cycle reagent kit. Base calling was done by Illumina Real Time Analysis (RTA) v3.4.4 and output of RTA was demultiplexed and converted to FastQ format with Illumina Bcl2fastq v2.20.0. Sequencing report: 20220616_SeqProduction_Scribner.xlsx
+
+&nbsp;
+
+## Download raw sequence data from RTSF
+Bash commands for getting raw data from MSU RTSF to MSU HPCC. Following the RTSF [instructions](https://rtsf.natsci.msu.edu/genomics/data-retrieval/#HPCC)
+```{bash, eval=FALSE, message=FALSE}
+# FTPS transfer from the RTSF FTP server to the HPCC only works if you are currently working from the rsync login node. Data for this run is in subdirectory 20220616_DNASeq_PE150
+
+cd /mnt/home/adamsn23/RedSwampCrayfish/rawData2022
+
+module load GCCcore/6.4.0 wget/1.19.4
+
+#wget -r -np -nH --ask-password ftps://<username>@<hostname>/<directory_name>
+wget -r -np -nH --ask-password ftps://scribnerk@titan.bch.msu.edu/20220616_DNASeq_PE150
+
+# check files with md5
+for FILE in *gz; do md5sum $FILE; done
+
+# in excel I compared content of md5.txt with the result of md5 check and they were the same
+```
+
+&nbsp;
+
+### Pull down the new fastqc html file made after trimming to look at
+```{bash, eval=FALSE, message=FALSE}
+# /Users/neasci/Documents/crayfish_lab/RSCseq2022
+
+adamsn23@gateway.hpcc.msu.edu:"/mnt/home/adamsn23/RedSwampCrayfish/rawData2022/20220616_DNASeq_PE150/FastQC/*.html" .
+
+# I renamed rawData2022 and the raw data directory
+mv rawData2022/ seq2022/ 
+mv 20220616_DNASeq_PE150/ rawData2022/ 
+```
+
+&nbsp;
+
+#### Load in R libraries
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(data.table)
+library(viridisLite)
+library(readxl)
+library(googlesheets4) #access Google drive with RSC sample data see https://www.tidyverse.org/blog/2020/05/googlesheets4-0-2-0/
+library(lubridate)
+library(kableExtra)
+library(ggrepel)
+library(ggpubr)
+
+```
+
+&nbsp;
+
+### Look at sequence results taken from 20220616_SeqProduction_Scribner.xlsx
+```{r, message=FALSE, warning=FALSE}
+seq.df <- read_excel("/Users/neasci/Documents/crayfish_lab/RSCseq2022/20220616_SeqProduction_Scribner.xlsx", sheet = "Sheet 1", skip = 14)
+
+# Tidy data
+seq.df <- seq.df %>% filter(!Lane == "Total")
+seq.df <- seq.df %>% filter(!`Sample Name` == "PhiX+Undeter")
+
+seq.df <- dplyr::rename(seq.df, Sample_ID =`Sample ID`, SampleName =`Sample Name`, PF_Reads=`PF Reads`, PF_Reads_perc=`% of PF Reads`, R1Q30_perc=`R1\r\n% ≥ Q30`, R2Q30_perc=`R2\r\n% ≥ Q30`, R1avgQ=`R1 Ave\r\nQ-Score`, R2avgQ=`R2 Ave\r\nQ-Score`, dataYield=`Yield (Gbp)`)
+
+seq.df <- seq.df %>% separate(SampleName, into = c("no", "library"), sep = "_") %>% select(!no) 
+
+hist(seq.df$PF_Reads)
+
+ggplot(seq.df, aes(x=reorder(library, dataYield), y=dataYield)) +
+  geom_point(size =4) +
+  xlab("Library") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+
+```
+
+&nbsp;
+
+## Set up METADATA for analyses
+```{r, message=FALSE, warning=FALSE}
+# ADULTS
+# load in Adults Sample_database data and tidy
+# Sheet 'Adults' from file 'Sample_database' from the Red Swamp Crayfish Google Drive
+gs4_deauth()
+samp <- read_sheet("https://docs.google.com/spreadsheets/d/1xEoqyWX1L-ZEvJLzepyNQK9n5s05p7cv-nKzHn4yFFM/edit?usp=sharing", sheet= "Adults", col_types = "ccicciciiicccc")
+
+# tidy columns
+# rename cols to remove spaces and special characters
+samp <- dplyr::rename(samp, Site_Abbrev =`Site Abbrev.`, Sample_ID =`Sample ID`, Carap_mm =`Carap-mm`, ND_conc =`ND-conc`, Seq_library =`Seq. library`, Tissue_location=`Tissue location`, Extracted_DNA_location=`Extracted DNA location`)
+
+samp <- as.data.frame(samp)
+
+# ** Is River Oaks different from River Oaks (2 ponds)? NO
+# ** Is Holiday 1 the same as Holiday Inn 1 and same with 2? YES
+# ** What is Holiday II? Holiday Inn 2? SAME
+# ** What is Preserve of Meadowbrook? DIFFERENT
+# Fix site names (capitalization, spelling, spaces, etc.)
+samp$Site <- gsub("(M", "M", samp$Site, fixed = TRUE)
+samp$Site <- gsub("Q)", "Q", samp$Site, fixed = TRUE)
+samp$Site <- gsub("River Oaks (2 ponds)", "River Oaks", samp$Site, fixed = TRUE)
+samp$Site <- gsub("Holiday 1", "Holiday Inn 1", samp$Site)
+samp$Site <- gsub("Holiday 2", "Holiday Inn 2", samp$Site)
+samp$Site <- gsub("Holiday II", "Holiday Inn 2", samp$Site)
+
+# add lifestage
+samp$stage <- "adult"
+
+# pull out samples seq'd in 2019 and 2020
+samp2020 <- samp %>% filter(Year %in% c(2019,  2020))
+#write.table(samp2020, file=paste0("~/Documents/crayfish_lab/RSCseq2022/adults2020_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# pull out samples seq'd in 2022
+plates2keep <- c("Plate 07-08-21", "Plate 08-31-21", "Plate 9-23-21", "Plate 10-14-21", "Plate 10-20-21", "Plate 10-28-21", "Plate 11-30-21")
+samp2022 <- samp %>% filter(Extracted_DNA_location %in% plates2keep)
+
+# JUVENILES
+gs4_deauth()
+juvs <- read_sheet("https://docs.google.com/spreadsheets/d/1xEoqyWX1L-ZEvJLzepyNQK9n5s05p7cv-nKzHn4yFFM/edit?usp=sharing", sheet= "Juveniles", col_types = "ccicciciiicccc")
+
+# tidy columns
+# rename cols to remove spaces and special characters
+juvs <- dplyr::rename(juvs, Site_Abbrev =`Site Abbrev.`, Sample_ID =`Sample ID`, Carap_mm =`Carap-mm`, ND_conc =`ND-conc`, Seq_library =`Seq. Lib`, Tissue_location=`Tissue location`, Extracted_DNA_location=`Extracted DNA location`)
+
+juvs <- as.data.frame(juvs)
+
+# fix dates - for date ranges, take first date
+juvs$Date2 <- str_split(juvs$Date, "-", simplify = T)[,1]
+juvs$Date2 <- mdy(juvs$Date2, truncated = 2)
+juvs$Date2 <- format(as.Date(juvs$Date2), "%m-%d")
+
+# fix site names
+juvs$Site <- gsub("Meadow Brook 1", "Meadowbrook Pond 1", juvs$Site)
+juvs$Site <- gsub("Meadowbrook1", "Meadowbrook Pond 1", juvs$Site)
+juvs$Site <- gsub("Meadowbrook 1", "Meadowbrook Pond 1", juvs$Site)
+juvs$Site <- gsub("Foxcreek12", "Fox Creek 12", juvs$Site)
+juvs$Site <- gsub("Foxcreek 12", "Fox Creek 12", juvs$Site)
+juvs$Site <- gsub("Foxcreek 17b", "Fox Creek 17b", juvs$Site)
+
+# add lifestage
+juvs$stage <- "juvenile"
+
+# pull out samples seq'd in 2019 and 2020
+juvs2020 <- juvs %>% filter(Year %in% c(2019,  2020))
+#write.table(juv.df2, file=paste0("~/Documents/crayfish_lab/RSCseq2022/juv2022_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# pull out samples seq'd in 2022
+plates2keep2 <- c("Plate 11-15-21", "Plate 11-18-21", "Plate 11-29-21", "Plate 12-2-21", "Plate 12-6-21 (2)", "Plate 12-9-21", "Plate 12-13-21 (2)")
+juvs2022 <- juvs %>% filter(Extracted_DNA_location %in% plates2keep2)
+
+
+# BERRIED FEMALES
+gs4_deauth()
+# load in moms
+bf <- read_sheet("https://docs.google.com/spreadsheets/d/1xEoqyWX1L-ZEvJLzepyNQK9n5s05p7cv-nKzHn4yFFM/edit?usp=sharing", sheet= "Juvenile carriers_moms", skip = 1 , col_types = "cciicciiiicccccc")
+
+# tidy columns
+# rename cols to remove spaces and special characters
+bf <- dplyr::rename(bf, Site_Abbrev =`Site Abbrev.`, Sample_ID =`Sample name`, Carap_mm =`Carap-mm`, Storage_location=`Storage location`, ND_conc =`ND-conc`, Seq_library =`Seq. Lib`, Tissue_location=`Tissue location`, Extracted_DNA_location=`Extracted DNA location`)
+
+bf <- as.data.frame(bf)
+bf <- bf %>% dplyr::select(-c(`...15`, `...16`)) %>% drop_na(Site)
+
+# fix dates - for date ranges, take first date
+bf$Date2 <- str_split(bf$Date, "-", simplify = T)[,1]
+bf$Date2 <- mdy(bf$Date2, truncated = 2)
+bf$Date2 <- format(as.Date(bf$Date2), "%m-%d")
+
+bf$ExtractedDate <- str_split(bf$Extracted_DNA_location, " ", simplify = T)[,2]
+
+# fix site names and years
+bf$Site <- gsub("Meadowbrook 1", "Meadowbrook Pond 1", bf$Site)
+bf$Site <- gsub("Meadowbrook 2", "Meadowbrook Pond 2", bf$Site)
+bf$Site <- gsub("Foxcreek 16", "Fox Creek 16", bf$Site)
+bf$Extracted_DNA_location <- gsub("Plate 11-3-2021", "Plate 11-3-21", bf$Extracted_DNA_location)
+bf$Extracted_DNA_location <- gsub("Plate 11-10-2021", "Plate 11-10-21", bf$Extracted_DNA_location)
+bf$Extracted_DNA_location <- gsub("Plate 11-16-2021", "Plate 11-16-21", bf$Extracted_DNA_location)
+
+# add lifestage
+bf$stage <- "berriedFemale"
+
+# pull out samples seq'd in 2019 and 2020
+bf2020 <- bf %>% filter(Year %in% c(2019,  2020))
+#write.table(bf2020, file=paste0("~/Documents/crayfish_lab/RSCseq2022/bf2020_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# pull out samples seq'd in 2022
+plates2keep3 <- c("Plate 11-1-21", "Plate 11-4-21 (1)", "Plate 11-4-21 (2)", "Plate 11-8-21", "Plate 12-6-2021(1)", "Plate 12-8-21", "Plate 12-10-21")
+bf2022 <- bf %>% filter(Extracted_DNA_location %in% plates2keep3)
+
+
+# OFFSPRING OF BERRIED FEMALES
+gs4_deauth()
+# load in offspring of berried females
+off <- read_sheet("https://docs.google.com/spreadsheets/d/1xEoqyWX1L-ZEvJLzepyNQK9n5s05p7cv-nKzHn4yFFM/edit?usp=sharing", sheet= "Juvenile carriers_offspring", skip = 1 , col_types = "cciicciiiccc")
+
+# tidy columns
+# rename cols to remove spaces and special characters
+off <- dplyr::rename(off, Site_Abbrev =`Site Abbrev.`, Sample_ID =`Sample name`, ND_conc =`ND-conc`, Seq_library =`Seq. Lib`, Tissue_location=`Tissue location`, Extracted_DNA_location=`Extracted DNA location`)
+
+off <- as.data.frame(off)
+off <- off %>% drop_na(Site)
+
+# fix dates - for date ranges, take first date
+off$Date2 <- str_split(off$Date, "-", simplify = T)[,1]
+off$Date2 <- mdy(off$Date2, truncated = 2)
+off$Date2 <- format(as.Date(off$Date2), "%m-%d")
+
+off$ExtractedDate <- str_split(off$Extracted_DNA_location, " ", simplify = T)[,2]
+
+# fix site names and dates
+off$Site <- gsub("Meadowbrook 1", "Meadowbrook Pond 1", off$Site)
+off$Site <- gsub("Foxcreek 16", "Fox Creek 16", off$Site)
+off$Site <- gsub("Foxcreek 17b", "Fox Creek 17b", off$Site)
+off$Extracted_DNA_location <- gsub("Plate 11-3-2021", "Plate 11-3-21", off$Extracted_DNA_location)
+off$Extracted_DNA_location <- gsub("Plate 11-10-2021", "Plate 11-10-21", off$Extracted_DNA_location)
+off$Extracted_DNA_location <- gsub("Plate 11-16-2021", "Plate 11-16-21", off$Extracted_DNA_location)
+#off$Extracted_DNA_location <- gsub("Plate 12-6-2021(1)", "Plate 12-6-21(1)", off$Extracted_DNA_location)
+off$Extracted_DNA_location <- gsub("Plate 12-8-2021", "Plate 12-8-21", off$Extracted_DNA_location)
+off$Extracted_DNA_location <- gsub("Plate 12-10-2021", "Plate 12-10-21", off$Extracted_DNA_location)
+#off$Extracted_DNA_location <- gsub("Plate 12-13-2021 (1)", "Plate 12-13-21 (1)", off$Extracted_DNA_location)
+#off$Extracted_DNA_location <- gsub("Plate 12-13-2021 (2)", "Plate 12-13-21 (2)", off$Extracted_DNA_location)
+off$Extracted_DNA_location <- gsub("Plate 12-16-2021", "Plate 12-16-21", off$Extracted_DNA_location)
+
+# add lifestage
+off$stage <- "offspring"
+
+# pull out samples seq'd in 2019 and 2020
+off2020 <- off %>% filter(Year %in% c(2019,  2020))
+#write.table(off2020, file=paste0("~/Documents/crayfish_lab/RSCseq2022/off2020_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# pull out samples seq'd in 2022
+plates2keep4 <- c("Plate 11-1-21", "Plate 11-4-21 (1)", "Plate 11-4-21 (2)", "Plate 11-8-21", "Plate 12-6-2021(1)", "Plate 12-8-21", "Plate 12-10-21", "Plate 12-13-2021 (1)", "Plate 12-13-2021 (2)", "Plate 12-16-21")
+off2022 <- off %>% filter(Extracted_DNA_location %in% plates2keep4)
+
+# LIB24_COMBO plate details
+combo <- read_tsv("~/Documents/crayfish_lab/libraryPreps/Lib24_combo.txt", col_names = T)
+combo <- dplyr::rename(combo, Site_Abbrev =`Site Abbrev.`, Sample_ID =`Sample name`, Carap_mm =`Carap-mm`, Storage_location=`Storage location`, ND_conc =`ND-conc`, Seq_library =`Seq. Lib`, Tissue_location=`Tissue location`)
+combo$Date2 <- str_split(combo$Date, "-", simplify = T)[,1]
+combo$Date2 <- mdy(combo$Date2, truncated = 2)
+combo$Date2 <- format(as.Date(combo$Date2), "%m-%d")
+
+#plates2keep5 <- c("Plate 11-3-2021", "Plate 11-3-21", "Plate 11-10-2021", "Plate 11-10-21", "Plate 11-16-2021", "Plate 11-16-21")
+
+combo$SequenceID <- gsub("FC17B", "FC17b", combo$SequenceID)
+combo$Sample_ID <- gsub("FC17B", "FC17b", combo$Sample_ID)
+combo$Seq_library <- as.integer(combo$Seq_library)
+combo <- combo %>% filter(!SequenceID == "empty")
+
+
+
+# COMBINE ALL METADATA for 2022
+meta.dfA <- full_join(samp2022, juvs2022)
+meta.dfB <- full_join(meta.dfA, bf2022)
+meta.dfC <- full_join(meta.dfB, off2022)
+meta.df <- full_join(meta.dfC, combo)
+
+
+# Add library names
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 07-08-21", "Lib1", "foo")
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 08-31-21", "Lib2", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 9-23-21", "Lib3", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 10-14-21", "Lib4", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 10-20-21", "Lib5", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 10-28-21", "Lib6", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-30-21", "Lib7", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-15-21", "Lib8", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-18-21", "Lib9", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-29-21", "Lib10", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-2-21", "Lib11", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-6-21 (2)", "Lib12", meta.df$library)
+
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-9-21", "Lib13", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-13-21 (2)"| meta.df$Extracted_DNA_location == "Plate 12-13-2021 (2)", "Lib14", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-1-21", "Lib15", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-4-21 (1)", "Lib16", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-4-21 (2)", "Lib17", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 11-8-21", "Lib18", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-6-2021(1)", "Lib19", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-8-21", "Lib20", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-10-21", "Lib21", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-13-2021 (1)", "Lib22", meta.df$library)
+meta.df$library <- ifelse(meta.df$Extracted_DNA_location == "Plate 12-16-21", "Lib23", meta.df$library)
+meta.df$library <- ifelse(meta.df$SequenceID %in% combo$SequenceID, "Lib24", meta.df$library)
+
+# Add year tags for sequence ID
+libs2add22 <- c("Lib1", "Lib2", "Lib3", "Lib4", "Lib5", "Lib6", "Lib8", "Lib9", "Lib10", "Lib11", "Lib12",  "Lib13", "Lib14", "Lib15",  "Lib16", "Lib17", "Lib18", "Lib23")
+meta.df$SequenceID <- ifelse(meta.df$library %in% libs2add22, paste0(meta.df$Sample_ID, "-22"), meta.df$SequenceID)
+
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib7", meta.df$Sample_ID, meta.df$SequenceID) #some reason lib7 already has '-212' tacked onto the Sample_ID
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib19", paste0(meta.df$Sample_ID, "-20"), meta.df$SequenceID)
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib19"&meta.df$Sample_ID %in% c("FC17b-M2-212", "FC17b-M3-212", "FC17b-M4-212", "SHD-M2-212"), meta.df$Sample_ID, meta.df$SequenceID)
+
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib20", paste0(meta.df$Sample_ID, "-20"), meta.df$SequenceID)
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib21", paste0(meta.df$Sample_ID, "-20"), meta.df$SequenceID)
+
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib22"&meta.df$Year == "2020", paste0(meta.df$Sample_ID, "-20"), meta.df$SequenceID)
+meta.df$SequenceID <- ifelse(meta.df$library == "Lib22"&meta.df$Year == "2021", paste0(meta.df$Sample_ID, "-22"), meta.df$SequenceID)
+
+# Lib24 already has tag on sequenceID
+
+# Fix name discrepancies
+meta.df$Sample_ID <- gsub("FC17B", "FC17b", meta.df$Sample_ID)
+meta.df$SequenceID <- gsub("FC17B", "FC17b", meta.df$SequenceID)
+meta.df$Site_Abbrev <- gsub("FC17B", "FC17b", meta.df$Site_Abbrev)
+meta.df$Site_Abbrev <- gsub("FC9B", "FC9b", meta.df$Site_Abbrev)
+meta.df$Sample_ID <- gsub("FC9B", "FC9b", meta.df$Sample_ID)
+meta.df$SequenceID <- gsub("FC9B", "FC9b", meta.df$SequenceID)
+
+### make sample lists
+adult.df <- meta.df %>% filter(stage == "adult")  %>% select(SequenceID)
+#write.table(adult.df, file=paste0("~/Documents/crayfish_lab/RSCseq2022/adult2022_list.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+adult.df2 <- meta.df %>% filter(stage == "adult")  
+#write.table(adult.df2, file=paste0("~/Documents/crayfish_lab/RSCseq2022/adult2022_meta.txt"), sep="\t", row.names=FALSE, col.names=T, quote=FALSE)
+
+juv.df <- meta.df %>% filter(stage == "juvenile") %>% select(SequenceID)
+#write.table(juv.df, file=paste0("~/Documents/crayfish_lab/RSCseq2022/juv2022_list.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+juv.df2 <- meta.df %>% filter(stage == "juvenile")
+#write.table(juv.df2, file=paste0("~/Documents/crayfish_lab/RSCseq2022/juv2022_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+bf.df <- meta.df %>% filter(stage == "berriedFemale") %>% select(SequenceID)
+#write.table(bf.df, file=paste0("~/Documents/crayfish_lab/RSCseq2022/berriedFemales2022_list.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+bf.df2 <- meta.df %>% filter(stage == "berriedFemale")
+#write.table(bf.df2, file=paste0("~/Documents/crayfish_lab/RSCseq2022/berriedFemales2022_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+off.df <- meta.df[grepl(glob2rx('*-M*-J*'), meta.df$SequenceID),]
+off.df2 <- off.df %>% select(SequenceID)
+#write.table(off.df2, file=paste0("~/Documents/crayfish_lab/RSCseq2022/offspring2022_list.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+#write.table(off.df, file=paste0("~/Documents/crayfish_lab/RSCseq2022/offspring2022_meta.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+adultJuvBF <- meta.df %>% filter( stage %in% c("adult", "juvenile", "berriedFemale")) %>% select(SequenceID)
+#write.table(adultJuvBF, file=paste0("~/Documents/crayfish_lab/RSCseq2022/adultJuvBF2022_list.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+# save all seq2022 metadata to one file
+#write.table(meta.df, file="~/Documents/crayfish_lab/RSCseq2022/seq2022_metadata.txt", sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+## Pre-processing 
+
+&nbsp;
+
+### Make directories needed for flipReads
+```{bash, eval=FALSE}
+# Create directories needed for 2_flipReads_NEA.sh
+mkdir /mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts
+mkdir /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT
+mkdir /mnt/home/adamsn23/RedSwampCrayfish/seq2022/SHELL
+mkdir /mnt/home/adamsn23/RedSwampCrayfish/seq2022/SHELL/dependencies
+
+#mkdir /mnt/gs18/scratch/users/adamsn23/RSC/
+mkdir /mnt/gs21/scratch/adamsn23/RSC/seq2022 # new HPCC scratch space, used to be /mnt/gs21/scratch/gs18
+
+```
+
+&nbsp;
+
+### Make files with list of barcodes for each library
+```{r, message=FALSE, warning=FALSE}
+pg.files <- list.files(path="~/Documents/crayfish_lab/libraryPreps/picoGreen", pattern='*.xlsx', full.names = TRUE)
+barcodes <- read_excel("~/Documents/crayfish_lab/libraryPreps/bestRADindexes_6-28-2022.xlsx", sheet="vertical")
+
+pgList <- list()
+for (FILE in pg.files){
+  pg <- read_excel(FILE, sheet = "Data Analysis- new 021022")
+  LIB1 <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(9)]
+  LIB2 <- unlist(strsplit(LIB1, "[' ']+"))[c(7)]
+  dfName <- paste( LIB2, "df", sep = '.' )
+  pg.df <- pg %>% select(`Well Position`, `Sample Name...3`, `Corrected [DNA] ng/ul   (by multiplying column G by dilution factor from column B)`) %>% rename(plateWell=`Well Position`, sampleID=`Sample Name...3`, DNAconc_pg=`Corrected [DNA] ng/ul   (by multiplying column G by dilution factor from column B)`) %>% mutate(library=LIB2) %>% filter(!row_number() %in% c(97, 98, 99))
+  pg.df <- full_join(pg.df, barcodes)
+  pgList[[dfName]] <- pg.df
+  barcode4file <- pg.df %>% select(RADbarcode, sampleID)
+  #write.table(barcode4file, file=paste0("~/Documents/crayfish_lab/libraryPreps/", LIB2, "_barcodes.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+  #write.table(pg.df, file=paste0("~/Documents/crayfish_lab/RSCseq2022/", LIB2, "_meta.txt"), sep="\t", row.names=FALSE, quote=FALSE)
+}
+
+pg.bigA <- do.call("rbind", pgList) # 2304 rows
+empties <- pg.bigA %>% filter(duplicated(.[["sampleID"]])) # 20 "empty" rows from Libs 1,5,7,11,17,24
+pg.big <- pg.bigA %>% filter(!sampleID == "empty") # 2283 rows
+```
+
+&nbsp;
+
+#### Copy barcode files to HPCC 
+```{bash, eval=FALSE}
+scp *barcodes.txt adamsn23@gateway.hpcc.msu.edu:"/mnt/home/adamsn23/RedSwampCrayfish/seq2022/SHELL/dependencies"
+
+```
+
+&nbsp;
+&nbsp;
+
+## Unzip and flip reads
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/2_flipReads_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: Flip_reads.sh
+#   Date: 01/05/21, 02/03/2022 (NEA), 06/28/2022 (NEA)
+#   Description: Flip the orientation of the Best RAD reads
+#--------------------------------------------------------------------------------------------------
+#       Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+DATA_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022/rawData2022
+my_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs21/scratch/adamsn23/RSC/seq2022   #changed from /mnt/gs18/scratch/users/adamsn23/RSC/seq2022 
+
+mkdir $my_PATH/SHELL/flipReads
+mkdir $my_PATH/QSTAT/flipReads
+
+mkdir $SCR/unzipped/
+mkdir $SCR/flipped/ #this line wasn't in Jared's script
+
+
+### Unzip the files
+cd $my_PATH/SHELL/flipReads
+
+find $DATA_PATH -name '*.fastq.gz' | while read -r LINE
+do
+dat=$(echo $LINE | awk -F "/" '{print $8}' | awk -F ".fastq" '{print $1}')
+datn=$(echo $LINE | awk -F "/" '{print $8}' | awk -F "_" '{print $2}') 
+
+echo '#!/bin/sh 
+#SBATCH -N 1
+#SBATCH -t 1:00:00
+#SBATCH --mem 64G 
+#SBATCH -J '$datn'_unzip
+#SBATCH -o '$my_PATH'/QSTAT/flipReads/'$datn'_unzip.o
+#SBATCH --error='$my_PATH'/QSTAT/flipReads/'$datn'_unzip.err
+
+## Unzip
+gunzip -c '$LINE' > '$SCR'/unzipped/'$dat'.fastq
+
+scontrol show job ${SLURM_JOB_ID} $' > "$datn"_unzip.sh
+
+sbatch "$datn"_unzip.sh
+
+done
+
+
+#### Flip reads
+
+cd $my_PATH/SHELL/flipReads
+
+find $DATA_PATH -name '*1_001.fastq.gz' | while read -r LINE
+do
+dat=$(echo $LINE | awk -F "/" '{print $8}' | awk -F ".fastq" '{print $1}')
+datn=$(echo $LINE | awk -F "/" '{print $8}' | awk -F "_" '{print $2}') 
+num=$(echo $LINE | awk -F "/" '{print $8}' | awk -F "_" '{print $3}')
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 12:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=64G
+#SBATCH -J '$datn'_flipReads
+#SBATCH -o '$my_PATH'/QSTAT/flipReads/'$datn'_flipReads.o
+#SBATCH --error='$my_PATH'/QSTAT/flipReads/'$datn'_flipReads.err
+
+perl '$my_PATH'/SHELL/dependencies/bRAD_flip_trim.pl \
+    '$my_PATH'/SHELL/dependencies/'$datn'_barcodes.txt \
+    '$SCR'/unzipped/RSC_'$datn'_'$num'_L004_R1_001.fastq \
+    '$SCR'/unzipped/RSC_'$datn'_'$num'_L004_R2_001.fastq \
+    '$SCR'/flipped/'$datn'_flipped.1.fq \
+    '$SCR'/flipped/'$datn'_flipped.2.fq
+    
+
+scontrol show job ${SLURM_JOB_ID} $' > "$datn"_flipReads.sh
+sbatch "$datn"_flipReads.sh
+
+done
+
+```
+
+&nbsp;
+
+Run jobs
+```{bash, eval=FALSE}
+bash scripts/2_flipReads_NEA.sh
+```
+
+&nbsp;
+
+### Zip the flipped reads
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/3_zipFlipped_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: Zip_flipped.sh
+#   Date: 01/06/21, 02/07/2022 (NEA), 06/28/2022 (NEA)
+#   Description: Zip the flipped best RAD reads
+#--------------------------------------------------------------------------------------------------
+#       Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+my_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+cd $my_PATH/SHELL/flipReads
+
+ls $SCR/flipped | grep -v ".2.fq" | awk -F "_flipped" '{print $1}' | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 3:59:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=64G
+#SBATCH -J Zip_'$LINE'
+#SBATCH -o '$my_PATH'/QSTAT/flipReads/Zip_'$LINE'.o
+#SBATCH --error '$my_PATH'/QSTAT/flipReads/Zip_'$LINE'.err
+
+cd '$SCR'/flipped
+
+gzip < ./'$LINE'_flipped.1.fq > '$LINE'_flipped.1.fq.gz
+gzip < ./'$LINE'_flipped.2.fq > '$LINE'_flipped.2.fq.gz
+
+scontrol show job ${SLURM_JOB_ID} $' > Zip_"$LINE".sh
+
+sbatch Zip_"$LINE".sh
+
+done
+
+```
+
+&nbsp;
+&nbsp;
+
+## Demultiplex the libraries into individual samples
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/4_demultiplex_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: 4_demultiplex.sh
+#   Date: 01/06/21,  02/08/2022 (NEA), 06/28/2022 (NEA)
+#   Description: Demultiplex libraries using process_radtags
+#--------------------------------------------------------------------------------------------------
+#   Author: Jared Homola, Nicole Adams
+#==================================================================================================
+
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs21/scratch/adamsn23/RSC/seq2022 # changed from /mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $RUN_PATH/SHELL/demult
+mkdir $RUN_PATH/QSTAT/demult
+mkdir $SCR/demult
+
+cd $RUN_PATH/SHELL/demult
+
+### Demultiplex 
+ls $SCR/flipped | grep -v ".gz" | grep -v ".2.fq" | awk -F "_flipped" '{print $1}' | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 5:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=24G
+#SBATCH -J '$LINE'_demultiplex
+#SBATCH -o '$RUN_PATH'/QSTAT/demult/'$LINE'_demultiplex.o
+#SBATCH --error '$RUN_PATH'/QSTAT/demult/'$LINE'_demultiplex.err
+
+module purge
+module load GCC/9.3.0 OpenMPI/4.0.3 Stacks/2.59
+
+process_radtags \
+    -1 '$SCR'/flipped/'$LINE'_flipped.1.fq.gz \
+    -2 '$SCR'/flipped/'$LINE'_flipped.2.fq.gz \
+    -i gzfastq \
+    -y gzfastq \
+    -o '$SCR'/demult/ \
+    -b '$RUN_PATH'/SHELL/dependencies/'$LINE'_barcodes.txt \
+    --inline_null \
+    -e sbfI \
+    --barcode_dist_1 1 \
+    --retain_header
+
+scontrol show job ${SLURM_JOB_ID}' > demultiplex_"$LINE".sh
+
+sbatch demultiplex_"$LINE".sh
+
+done
+```
+
+&nbsp;
+
+### Combine demultiplex results
+```{bash, eval=FALSE}
+cd /mnt/home/adamsn23/RedSwampCrayfish/seq2022/
+
+### Summarize demult results
+
+echo "LIB totSequences retainedReads percRetained" > OUT/demultRes.txt
+
+for FILE in QSTAT/demult/Lib*_demultiplex.err
+do
+ind=$(echo $FILE | awk -F "/" '{print $3}' | awk -F "_" '{print $1}')
+res1=$(grep 'total sequences' $FILE | grep -Eo '[0-9]{1,}' | tr -s '\n' '\t')
+res2=$(grep 'retained reads (' $FILE | grep -Eo '[0-9]{1,}' | tr -s '\n' '\t')
+echo $ind $res1 $res2 >> OUT/demultRes.txt
+done
+
+```
+
+&nbsp;
+&nbsp;
+
+## Remove PCR clones
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/5_removeClones_NEA.sh)
+Since the number of samples exceeds how many jobs that can be run on the HPCC I split them up: grep "FC", grep "MB", grep "SHD"; then did grep -v "FC" | grep -v "MB" | grep -v "SHD" to get the rest
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: removeClones.sh
+#   Date: 01/06/21, 02/08/2022 (NEA), 06/28/2022 (NEA)
+#   Description: Filter clonal reads from data
+#--------------------------------------------------------------------------------------------------
+#	Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $SCR/cloneFilter
+mkdir $RUN_PATH/SHELL/cloneFilter
+mkdir $RUN_PATH/QSTAT/cloneFilter
+mkdir $RUN_PATH/OUT
+
+cd $RUN_PATH/SHELL/cloneFilter
+
+# too many files to submit to slurm so did FC and XX separate, then did the rest
+ls $SCR/demult/ | grep "fq" | grep -v ".2.fq.gz" | grep -v "rem" | grep "FC" | sed 's/\.1\.fq\.gz//g' | sort | uniq | while read -r LINE
+#ls $SCR/demult/ | grep "fq" | grep -v ".2.fq.gz" | grep -v "rem" | grep -v "PC" | grep -v "FC" | sed 's/\.1\.fq\.gz//g' | sort | uniq | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=32G
+#SBATCH -J '$LINE'_cloneFilter
+#SBATCH -o '$RUN_PATH'/QSTAT/cloneFilter/cloneFilter.'$LINE'.o
+#SBATCH --error '$RUN_PATH'/QSTAT/cloneFilter/cloneFilter.'$LINE'.err
+
+module purge
+module load GCC/9.3.0 OpenMPI/4.0.3 Stacks/2.59
+
+clone_filter -1 '$SCR'/demult/'$LINE'.1.fq.gz \
+    -2 '$SCR'/demult/'$LINE'.2.fq.gz \
+    -i gzfastq \
+    -o '$SCR'/cloneFilter/
+
+scontrol show job ${SLURM_JOB_ID}' > ./cloneFilter."$LINE".sh
+
+sbatch ./cloneFilter."$LINE".sh
+
+done
+
+
+### Summarize results
+##grep '% clone reads' $RUN_PATH/QSTAT/cloneFilter/cloneFilter*.err >> $RUN_PATH/OUT/cloneFilterRes.txt
+
+#for FILE in QSTAT/cloneFilter/cloneFilter*.err 
+#do 
+#ind=$(echo $FILE | awk -F "/" '{print $3}' | awk -F "." '{print $2}')  
+##perc=$(grep -oP '.{0,5}%' $FILE) 
+#res=$(grep '% clone'  $FILE | grep -Eo '[0-9]{1,}' | tr -s '\n' '\t') 
+#echo $ind $res >> OUT/cloneFilterRes.txt 
+#done 
+```
+
+&nbsp;
+
+### Look at clone results
+```{r, message=FALSE, warning=FALSE}
+cl <- read.delim("~/Documents/crayfish_lab/RSCseq2022/cloneFilterRes.txt", header = F) #N=2284
+
+cl2 <- cl %>% separate(V1, into = c("ind", "inputPairs", "outputPairs", "discardedPairs", "clone1", "clone2"), sep = " ") %>% unite("percCloneReads", clone1:clone2, sep = ".") 
+
+cols2chg <- c("inputPairs", "outputPairs", "discardedPairs", "percCloneReads")
+cl2[cols2chg] <- sapply(cl2[cols2chg],as.numeric)
+cl2$ind <- gsub("FC815-212", "FC8-15-212", cl2$ind)
+cl2$ind <- gsub("FC17B", "FC17b", cl2$ind)
+
+# make pop columns
+cl3 <- cl2 %>% mutate(SequenceID = ind) %>% mutate(pop = ind) %>% separate(pop, into = c("pop", "extra"), sep = "-") %>% select(-extra)
+# Fix name discrepancies
+cl3$SequenceID <- gsub("FC17B", "FC17b", cl3$SequenceID)
+cl3$SequenceID <- gsub("SHD-M24", "SHD-M14", cl3$SequenceID)
+cl3$SequenceID <- gsub("FC9B", "FC9b", cl3$SequenceID)
+
+meta.df2 <- full_join(meta.df, cl3, by="SequenceID")
+
+
+percClone.p <- ggplot(meta.df2 %>% filter(!pop == "empty"), aes(x=reorder(library, percCloneReads), y=percCloneReads)) +
+  geom_boxplot(show.legend = F) +
+  xlab("library") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+
+percClone.p2 <- ggplot(meta.df2 %>% filter(!pop == "empty"), aes(x=reorder(pop, percCloneReads), y=percCloneReads)) +
+  geom_boxplot(show.legend = F) +
+  xlab("population") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+
+# Get qual amounts
+cl.tabA <- meta.df2 %>% filter(!pop == "empty") %>% summarise(mean=mean(percCloneReads), sd=sd(percCloneReads)) # 69%
+cl.tabA <- cl.tabA %>% mutate(pop="all") %>% dplyr::select(pop, mean, sd)
+cl.tabB <- meta.df2 %>% filter(!pop == "empty") %>% group_by(pop) %>% summarise(mean=mean(percCloneReads), sd=sd(percCloneReads))
+cl.tab <- rbind(cl.tabA, cl.tabB)
+
+
+# look for samples with high number of clones
+cl.qts <- quantile(meta.df2$percCloneReads,probs=c(.05,.95), na.rm = T)
+cl.qts.p <- ggplot(meta.df2 %>% filter(!pop == "empty"), aes(x=percCloneReads)) +
+ # geom_density() +
+  geom_histogram() +
+  geom_vline(xintercept = cl.qts[1], color="red", linetype="dashed") +
+  geom_vline(xintercept = cl.qts[2], color="red", linetype="dashed") +
+  theme_minimal() +
+  theme(text = element_text(size = 20)) 
+
+high.clone <- meta.df2 %>% filter(percCloneReads > cl.qts[2])
+
+hc.tab <- high.clone %>% group_by(pop) %>% tally()
+
+
+ggarrange(percClone.p, percClone.p2)
+
+```
+
+&nbsp;
+&nbsp;
+
+## Trim and filter
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/6_trimQualityFilter_NEA.sh)
+Since the number of samples exceeds how many jobs that can be run on the HPCC I split them up: grep "FC", grep "MB", grep "SHD"; then did grep -v "FC" | grep -v "MB" | grep -v "SHD" to get the rest
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: 6_trimQualityFilter.sh
+#   Date: 01/07/20, 02/10/2022 (NEA), 06/29/2022 (NEA)
+#   Description: Use Trimmomatic to trim reads and quality filter
+#--------------------------------------------------------------------------------------------------
+#	Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+### Need to rename files by removing the extra .1 or .2 that was inserted
+find $SCR/cloneFilter -type f -name '*.1.1.fq.gz' | while read FILE ; do
+    newfile="$(echo ${FILE} | sed -e 's/\.1.fq.gz/.fq.gz/')" ;
+    mv "${FILE}" "${newfile}" ;
+done 
+
+find $SCR/cloneFilter -type f -name '*.2.2.fq.gz' | while read FILE ; do
+    newfile="$(echo ${FILE} | sed -e 's/\.2.fq.gz/.fq.gz/')" ;
+    mv "${FILE}" "${newfile}" ;
+done 
+
+
+mkdir $SCR/trimmed
+mkdir $RUN_PATH/SHELL/trimQualityFilter
+mkdir $RUN_PATH/QSTAT/trimQualityFilter
+
+cd $RUN_PATH/SHELL/trimQualityFilter
+
+ls $SCR/cloneFilter | grep "fq" | grep -v ".2.fq.gz" | grep "FC" | sed 's/\.1\.fq\.gz//g' | while read -r LINE
+do
+echo '#!/bin/sh 
+#SBATCH --nodes=1-4
+#SBATCH --ntasks=1
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J '$LINE'.trimQualityFilter
+#SBATCH -o '$RUN_PATH'/QSTAT/trimQualityFilter/trimQualityFilter.'$LINE'.o
+#SBATCH --error '$RUN_PATH'/QSTAT/trimQualityFilter/trimQualityFilter.'$LINE'.err
+
+module purge
+module load Trimmomatic/0.39-Java-11 Java/1.8.0_162
+
+cd '$SCR'/cloneFilter
+java -jar $EBROOTTRIMMOMATIC/trimmomatic-0.39.jar PE -threads 4 -phred33 \
+'$LINE'.1.fq.gz '$LINE'.2.fq.gz \
+'$SCR'/trimmed/'$LINE'_paired.1.fq.gz '$SCR'/trimmed/'$LINE'_unpaired.1.fq.gz \ '$SCR'/trimmed/'$LINE'_paired.2.fq.gz '$SCR'/trimmed/'$LINE'_unpaired.2.fq.gz \
+ILLUMINACLIP:/mnt/research/Scribner_Lab/projects/RedSwampCrayfish_MISGP/SHELL/dependencies/adapters.fa:2:30:10 SLIDINGWINDOW:4:15 MINLEN:50 
+
+scontrol show job ${SLURM_JOB_ID}' > ./trimQualityFilter."$LINE".sh
+
+sbatch ./trimQualityFilter."$LINE".sh
+
+done
+
+
+###### How many reads were trimmed and filtered? ######
+#grep 'Surviving' $RUN_PATH/QSTAT/trimQualityFilter/trimQualityFilter*.o >> $RUN_PATH/OUT/trimQualityFilterRes.txt
+
+#for FILE in QSTAT/trimQualityFilter/trimQualityFilter*.err
+#do
+#ind=$(echo $FILE | awk -F "/" '{print $3}' | awk -F "." '{print $2}')
+#res=$(grep 'Surviving'  $FILE | awk -F " " '{print $4 "\t" $7 "\t" $8 "\t" $12 "\t" $13 "\t" $17 "\t" $18 "\t" $20 "\t" $21}')
+#echo $ind $res >> OUT/trimQualityFilterRes.txt
+#done
+
+```
+
+&nbsp;
+
+### Look at trim and filter results
+```{r, message=FALSE, warning=FALSE}
+fil <- read.delim("~/Documents/crayfish_lab/RSCseq2022/trimQualityFilterRes.txt", header = F) #N=2978
+
+fil2 <- fil %>% separate(V1, into = c("ind", "inputPairs", "survivingPairs", "percSurvivingPairs", "survivingForward", "percSurvivingForward", "survivingReverse", "percSurvivingReverse", "dropped", "percDropped"), sep = " ") 
+
+perc2num <- c("percSurvivingPairs", "percSurvivingForward", "percSurvivingReverse", "percDropped")
+fil2[perc2num] <- lapply(fil2[perc2num], gsub, pattern = "\\(", replacement = "")
+fil2[perc2num] <- lapply(fil2[perc2num], gsub, pattern = "%)", replacement = "")
+
+cols2chg2 <- c("inputPairs", "survivingPairs", "percSurvivingPairs", "survivingForward", "percSurvivingForward", "survivingReverse", "percSurvivingReverse", "dropped", "percDropped")
+fil2[cols2chg2] <- sapply(fil2[cols2chg2],as.numeric)
+
+fil3 <- fil2 %>% mutate(pop = ind) %>% separate(pop, into = c("pop", "extra"), sep = "-") %>% select(-extra)
+fil4 <- fil3 %>% filter(!grepl("paired",ind))
+# Fix name discrepancies
+fil4$ind <- gsub("FC815-212", "FC8-15-212", fil4$ind)
+fil4$ind <- gsub("FC17B", "FC17b", fil4$ind)
+fil4$ind <- gsub("FC17B", "FC17b", fil4$ind)
+fil4$ind <- gsub("SHD-M24", "SHD-M14", fil4$ind)
+fil4$ind <- gsub("FC9B", "FC9b", fil4$ind)
+fil4 <- fil4 %>% mutate(SequenceID=ind)
+
+fil.tab <- fil4 %>% filter(ind=="empty") %>% summarise(mean=mean(percSurvivingPairs), sd=sd(percSurvivingPairs))
+
+meta.df3 <- full_join(meta.df2, fil4, by="SequenceID")
+
+trim.p <- ggplot(meta.df3, aes(x=percSurvivingPairs )) +
+  geom_histogram() +
+  xlab("Percent_surviving_pairs") +
+  theme_classic()
+
+trim.p
+```
+
+&nbsp;
+&nbsp;
+
+## Mapping to reference genome
+### Make files needed for mapping
+```{bash, eval=FALSE}
+mkdir $SCRATCH/RSC/seq2022/trimmed/paired
+
+mv $SCRATCH/RSC/seq2022/trimmed/*_paired* $SCRATCH/RSC/seq2022/trimmed/paired
+
+```
+
+&nbsp;
+
+### Map
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/8_bwaMemMap_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: bwaMemMap.sh
+#   Date: 01/07/21, 02/11/2022 (NEA), 07/04/2022 (NEA)
+#   Description: Map reads to reference genome using bwa-mem
+#--------------------------------------------------------------------------------------------------
+#	Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $SCR/mapped
+mkdir $RUN_PATH/SHELL/mapping
+mkdir $RUN_PATH/QSTAT/mapping
+
+cd $RUN_PATH/SHELL/mapping
+ls $SCR/trimmed/paired | grep "fq" | grep -v ".2.fq.gz" | sed 's/\_paired.1\.fq\.gz//g' | grep "FC" | uniq | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=36G
+#SBATCH -J '$LINE'.bwaMemMap
+#SBATCH -o '$RUN_PATH'/QSTAT/mapping/'$LINE'.bwaMemMap.o
+#SBATCH --error '$RUN_PATH'/QSTAT/mapping/'$LINE'.bwaMemMap.err
+
+module purge
+module load GCC/6.4.0-2.28 OpenMPI/2.1.1 BWA/0.7.17 SAMtools/1.9
+
+cd '$SCR'/trimmed/paired
+
+bwa mem -R "@RG\tID:'$LINE'\tSM:'$LINE'\tPL:ILLUMINA\tLB:LB1" /mnt/home/adamsn23/RedSwampCrayfish/reference/GCF_020424385.1_ASM2042438v2_genomic.fna ./'$LINE'_paired.1.fq.gz ./'$LINE'_paired.2.fq.gz | samtools view -Sb - > ../../mapped/'$LINE'.pe.bam 
+
+scontrol show job ${SLURM_JOB_ID}' > ./bwaMemMap."$LINE".sh
+
+sbatch ./bwaMemMap."$LINE".sh
+
+done
+
+```
+
+&nbsp;
+
+### Sort mapped BAMs
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/10_sortBAM_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: 10_sortBAM.sh
+#   Date: 01/07/20, 02/15/2022 (NEA), 07/04/2022 (NEA)
+#   Description: Sort BAM files
+#--------------------------------------------------------------------------------------------------
+#	Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $RUN_PATH/QSTAT/sortBAM
+mkdir $RUN_PATH/SHELL/sortBAM_jobs
+mkdir $RUN_PATH/OUT/sorted
+
+cd $RUN_PATH/SHELL/sortBAM_jobs
+ls $SCR/mapped | grep bam | awk -F "." '{print $1}' | grep "SHD" | sort | uniq | while read -r LINE
+do
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J '$LINE'.sortBAM
+#SBATCH -o '$RUN_PATH'/QSTAT/sortBAM/'$LINE'.sortBAM.o
+#SBATCH --error '$RUN_PATH'/QSTAT/sortBAM/'$LINE'.sortBAM.err
+
+module purge
+module load GCC/9.3.0 SAMtools/1.15
+
+samtools sort '$SCR'/mapped/'$LINE'.pe.bam -o '$RUN_PATH'/OUT/sorted/'$LINE'.pe.sorted.bam
+
+scontrol show job ${SLURM_JOB_ID}' > ./sortBAM."$LINE".sh
+
+sbatch ./sortBAM."$LINE".sh
+
+done
+
+
+```
+
+&nbsp;
+
+## Filter mapped BAMs
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/11_filterBAMS_NEA.sh)
+-q 20=keep quality >= 20; -h=keep header; -f2=keep proper pairs(PROPER_PAIR)? ; -F2308=exclude unmapped reads, not primary alignment, supplementary alignment.  see [this calculater](https://broadinstitute.github.io/picard/explain-flags.html)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: filterBAM.sh
+#   Date: 01/07/21, 03/03/2022 (NEA), 07/05/2022 (NEA)
+#   Description: Filter BAM files
+#--------------------------------------------------------------------------------------------------
+#	Authors: Jared Homola, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $RUN_PATH/QSTAT/filterBAM
+mkdir $RUN_PATH/SHELL/filterBAM_jobs
+mkdir $RUN_PATH/OUT/filtered
+
+cd $RUN_PATH/SHELL/filterBAM_jobs
+ls $RUN_PATH/OUT/sorted | grep bam | awk -F "." '{print $1}' | grep "SHD" | sort | uniq | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J '$LINE'.filterBAM
+#SBATCH -o '$RUN_PATH'/QSTAT/filterBAM/'$LINE'.filterBAM.o
+#SBATCH --error '$RUN_PATH'/QSTAT/filterBAM/'$LINE'.filterBAM.err
+
+module purge
+module load GCC/9.3.0 SAMtools/1.15
+
+cd '$RUN_PATH'/OUT/sorted
+samtools view -q 20 -h -f2 -F2308  '$LINE'.pe.sorted.bam | samtools view -Sb > ../filtered/'$LINE'.pe.sorted.filtered.bam
+
+scontrol show job ${SLURM_JOB_ID}' > ./filterBAM."$LINE".sh
+
+sbatch ./filterBAM."$LINE".sh
+
+done
+```
+
+&nbsp;
+
+## Mapping metrics
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/11B_mapMetrics_NEA.sh)  
+```{bash, eval=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1-4
+#SBATCH --ntasks=6
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J mapMetrics
+#SBATCH -o /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/mapMetrics.o
+#SBATCH --error /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/mapMetrics.err
+
+#==================================================================================================
+#   File: 11B_mapMetrics_NEA.sh
+#   Date: 03/22/2022, 07/05/2022
+#   Description: Get summary of mapping
+#--------------------------------------------------------------------------------------------------
+#       Authors: Nicole Adams
+#==================================================================================================
+
+module purge
+module load GCC/9.3.0 SAMtools/1.15
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+BAM_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022/OUT/sorted
+
+
+cd $RUN_PATH/SHELL
+
+touch $BAM_PATH/mapSummary_seq2022.txt
+
+for sample in `ls $BAM_PATH/*sorted.bam | cut -f1 -d'.'`
+do
+  samtools flagstat "$sample".pe.sorted.bam -@ 6  > "$sample"_mapSum.txt
+ awk 'FNR == 1{ print FILENAME }' "$sample"_mapSum.txt >> $BAM_PATH/mapSummary_seq2022.txt
+ cat "$sample"_mapSum.txt >> $BAM_PATH/mapSummary_seq2022.txt
+
+done
+
+for sample in $BAM_PATH/*mapSum.txt; do awk 'FNR == 1{ print FILENAME } {printf "%-20s %-40s\n", $1, $3}' OFS="\t" $sample | awk '
+{
+    for (i=1; i<=NF; i++)  {
+        a[NR,i] = $i
+    }
+}
+NF>p { p = NF }
+END {
+    for(j=1; j<=p; j++) {
+        str=a[1,j]
+        for(i=2; i<=NR; i++){
+            str=str" "a[i,j];
+        }
+        print str
+    }
+}' >> $BAM_PATH/mapSummary_seq2022.2.txt; done
+
+grep 'mnt' $BAM_PATH/mapSummary_seq2022.2.txt > $BAM_PATH/mapSummary_seq2022.3.txt
+
+rm $BAM_PATH/*_mapSum.txt
+```
+
+&nbsp;
+
+### Repeat for filtered BAMs (11B_mapMetrics_filtered_NEA.sh)
+```{bash, eval=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1-4
+#SBATCH --ntasks=8
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=6
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J mapMetrics
+#SBATCH -o /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/mapMetrics.o
+#SBATCH --error /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/mapMetrics.err
+
+#==================================================================================================
+#   File: 11B_mapMetrics_NEA.sh
+#   Date: 03/22/2022, 07/05/2022
+#   Description: Get summary of mapping
+#--------------------------------------------------------------------------------------------------
+#       Authors: Nicole Adams
+#==================================================================================================
+
+module purge
+module load GCC/9.3.0 SAMtools/1.15
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+BAM_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022/OUT/filtered
+
+
+cd $RUN_PATH/SHELL
+
+touch $BAM_PATH/mapSummary_seq2022_filt.txt
+
+for sample in `ls $BAM_PATH/*filtered.bam | cut -f1 -d'.'`
+do
+  samtools flagstat "$sample".pe.sorted.filtered.bam -@ 6  > "$sample"_mapSum.txt
+ awk 'FNR == 1{ print FILENAME }' "$sample"_mapSum.txt >> $BAM_PATH/mapSummary_seq2022_filt.txt
+ cat "$sample"_mapSum.txt >> $BAM_PATH/mapSummary_seq2022_filt.txt
+
+done
+
+for sample in $BAM_PATH/*mapSum.txt; do awk 'FNR == 1{ print FILENAME } {printf "%-20s %-40s\n", $1, $3}' OFS="\t" $sample | awk '
+{
+    for (i=1; i<=NF; i++)  {
+        a[NR,i] = $i
+  }
+}
+NF>p { p = NF }
+END {
+    for(j=1; j<=p; j++) {
+        str=a[1,j]
+        for(i=2; i<=NR; i++){
+            str=str" "a[i,j];
+        }
+        print str
+    }
+}' >> $BAM_PATH/mapSummary_seq2022_filt.2.txt; done
+
+grep 'mnt' $BAM_PATH/mapSummary_seq2022_filt.2.txt > $BAM_PATH/mapSummary_seq2022_filt.3.txt
+
+rm $BAM_PATH/*_mapSum.txt
+
+```
+
+&nbsp;
+
+#### Examine mapping results in R
+I ran summary stats for sorted bams (.pe.sorted.bam) and filtered bams (.pe.sorted.filtered.bam)
+```{r, message=FALSE, warning=FALSE}
+msumA <- read.table("~/Documents/crayfish_lab/RSCseq2022/mapSummary_seq2022.3.txt")
+
+colnames(msumA) <- c("Sample", "QCpassedReads", "primary", "secondary", "supplementary", "duplicates", "primaryDuplicates", "mapped", "primaryMapped", "paired", "read1", "read2", "properlyPaired", "itselfYmateMapped", "singletons", "mateMappedDiffChr", "mateMappedDiffChr_mapQ5")
+
+nothanks <- c("a", "b", "c", "d", "e", "f", "g", "h")
+msum <- msumA %>% separate(Sample, c("a", "b", "c", "d", "e", "f", "g", "h", "i"), sep = "/") %>% select(-nothanks) %>%
+  separate(i, c("Sample", "stuff"), sep = "_") %>% select(-stuff)
+
+msum$percentMap <- (msum$mapped/msum$QCpassedReads)*100
+msum$percentPaired <- (msum$properlyPaired/msum$paired)*100
+msum$percentSingle <- (msum$singletons/msum$properlyPaired)*100
+
+# Fix name discrepancies
+msum$Sample <- gsub("FC815-212", "FC8-15-212", msum$Sample)
+msum$Sample <- gsub("FC17B", "FC17b", msum$Sample)
+msum$Sample <- gsub("FC17B", "FC17b", msum$Sample)
+msum$Sample <- gsub("SHD-M24", "SHD-M14", msum$Sample)
+msum$Sample <- gsub("FC9B", "FC9b", msum$Sample)
+
+msum <- msum %>% mutate(SequenceID=Sample)
+
+# add in pop names
+msum <- msum %>% mutate(pop = Sample) %>% separate(pop, into = c("pop", "extra"), sep = "-") %>% select(-extra)
+
+
+meta.df4 <- full_join(meta.df3, msum, by="SequenceID")
+
+
+msum.p <- ggplot(msum %>% filter(!Sample == "empty"), aes(x=reorder(pop, percentMap), y=percentMap)) +
+  geom_boxplot(show.legend = F) +
+ # geom_jitter(aes(alpha=0.4), size=0.8, show.legend = F) +
+  xlab("population") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+ 
+msum.p2 <- ggplot(meta.df4 %>% filter(!Sample == "empty") , aes(x=reorder(library, percentMap), y=percentMap)) +
+  geom_boxplot(show.legend = F) +
+ # geom_jitter(aes(alpha=0.4), size=0.8, show.legend = F) +
+  xlab("library") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+
+
+msum.p.clark <- msum %>% filter(!pop %in% c("Cfod", "Ctho", "Fprop", "Fvir", "Lpol", "Pacu")) %>% filter(!Sample == "empty")
+msum.pc.tab <- msum.p.clark %>% group_by(pop) %>% summarise(meanPercentMap=mean(percentMap, na.rm=TRUE), meanPercentPaired=mean(percentPaired, na.rm=TRUE))
+msum.pc.tab2 <- msum.p.clark %>% summarise(meanPercentMap=mean(percentMap, na.rm=TRUE), meanPercentPaired=mean(percentPaired, na.rm=TRUE))
+msum.pc.tab2$Samples <- "P.clarkii"
+
+msum.oth.sp <- msum %>% filter(pop %in% c("Cfod", "Ctho", "Fprop", "Fvir", "Lpol", "Pacu"))
+msum.sp.tab <- msum.oth.sp %>% group_by(pop) %>% summarise(meanPercentMap=mean(percentMap, na.rm=TRUE), meanPercentPaired=mean(percentPaired, na.rm=TRUE))
+msum.sp.tab2 <- msum.oth.sp %>% summarise(meanPercentMap=mean(percentMap, na.rm=TRUE), meanPercentPaired=mean(percentPaired, na.rm=TRUE))
+msum.sp.tab2$Samples <- "OtherSpecies"
+
+msum.tab.all <- rbind(msum.pc.tab, msum.sp.tab)
+msum.tab.all2 <- rbind(msum.pc.tab2, msum.sp.tab2)
+
+kable(msum.tab.all2, digits = 2, caption = "Mapping summary") %>% kableExtra::kable_styling()
+
+ggarrange(msum.p2, msum.p)
+```
+
+&nbsp;
+&nbsp;
+
+### Read counts
+(/mnt/home/adamsn23/RedSwampCrayfish/seq2022/scripts/12_countReads_NEA.sh)
+```{bash, eval=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1-4
+#SBATCH --ntasks=8
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8G
+#SBATCH -J Count_reads
+#SBATCH -o /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/Count_reads.o
+#SBATCH --error /mnt/home/adamsn23/RedSwampCrayfish/seq2022/QSTAT/Count_reads.err
+
+#==================================================================================================
+#   File: Count_reads.sh
+#   Date: 04/22/19, 03/11/2022 (NEA), 07/05/2022 (NEA)
+#   Description: Flip the orientation of the Best RAD reads
+#       Run: Interactively - array
+#--------------------------------------------------------------------------------------------------
+#       Authors: Jared Homola, Seth Smith, Nicole Adams
+#==================================================================================================
+
+#Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+cd $RUN_PATH/SHELL
+
+touch $RUN_PATH/OUT/Read_counts.txt
+
+# old way
+#ls $SCR/RSC/trimmed/paired | grep "fq" | grep -v ".2.fq.gz" | grep -v "rem" | awk -F "." '{print $1}' | sort | uniq | while read -r LINE
+#do
+#   echo $LINE >> $RUN_PATH/OUT/Read_counts.txt
+#   zcat $SCR/RSC/trimmed/paired/$LINE.1.fq.gz | echo $((`wc -l`/4)) >> #$RUN_PATH/OUT/Read_counts.txt
+#done 
+
+# new way, puts name and number on same line
+ls $SCR/trimmed/paired | grep "fq" | grep -v ".2.fq.gz" | grep -v "rem" | awk -F "." '{print $1}' | sort | uniq | while read -r LINE 
+do 
+ind=$(echo $LINE) 
+dat=$(zcat $SCR/trimmed/paired/$LINE.1.fq.gz | echo $((`wc -l`/4))) 
+echo $ind $dat >> $RUN_PATH/OUT/Read_counts.txt 
+done  
+
+```
+
+&nbsp;
+
+### Examine read counts in R
+```{r, message=FALSE, warning=FALSE}
+counts.a <- as.data.frame(read.delim("~/Documents/crayfish_lab/RSCseq2022/Read_counts.txt", header = FALSE))
+
+counts.b <- counts.a %>% separate(V1, into = c("ind", "reads"), sep = " ") %>%
+  separate(ind, into = c("ind", "stuff"), sep = "_") %>% select(-stuff)
+
+# some samples are present twice in the file... so remove them
+counts.c <- counts.b %>% distinct(ind, .keep_all = T)
+
+# Fix name discrepancies
+counts.c$ind <- gsub("FC815-212", "FC8-15-212", counts.c$ind)
+counts.c$ind <- gsub("FC17B", "FC17b", counts.c$ind)
+counts.c$ind <- gsub("FC17B", "FC17b", counts.c$ind)
+counts.c$ind <- gsub("SHD-M24", "SHD-M14", counts.c$ind)
+counts.c$ind <- gsub("FC9B", "FC9b", counts.c$ind)
+
+counts.c <- counts.c %>% mutate(SequenceID=ind)
+
+
+# add in pop names
+counts.c <- counts.c %>% mutate(pop = ind) %>% separate(pop, into = c("pop", "extra"), sep = "-") %>% select(-extra)
+
+counts <- counts.c %>% mutate(reads= as.numeric(reads))
+
+
+meta.df5 <- full_join(meta.df4, counts, by="SequenceID")
+
+
+
+counts.p <- ggplot(counts %>% filter(!pop == "empty"), aes(x=reorder(pop, reads), y=reads)) +
+  geom_boxplot(show.legend = F) +
+ # geom_jitter(aes(alpha=0.4), size=0.8, show.legend = F) +
+  xlab("populations") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) 
+
+
+
+# identify low read samples:
+qts <- quantile(counts$reads,probs=c(.05,.95))
+counts.p2 <- ggplot(counts %>% filter(!pop == "empty"), aes(x=reads)) +
+ # geom_density() +
+  geom_histogram() +
+  geom_vline(xintercept = qts[1], color="red", linetype="dashed") +
+  geom_vline(xintercept = qts[2], color="red", linetype="dashed") +
+  theme_minimal() +
+  theme(text = element_text(size = 20)) 
+
+low.counts <- counts %>% filter(reads < qts[1]) %>% arrange(reads)
+
+low.cnt.p <- ggplot(low.counts %>% filter(reads <2000), aes(x=reorder(ind, reads), y=reads)) +
+  geom_point() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) 
+
+low.cnt.p
+```
+
+&nbsp;
+
+## Estimate depth of coverage with bedtools
+Batch script to calculate coverage using Picard (12B_coverage_NEA.sh)
+```{bash, eval=FALSE}
+#==================================================================================================
+#   File: 12B_coverage_NEA.sh
+#   Date: 07/06/2022 (NEA)
+#   Description: Get coverage
+#--------------------------------------------------------------------------------------------------
+#	Authors: Nicole Adams
+#==================================================================================================
+
+# Define alias for project root directory
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/seq2022
+SCR=/mnt/gs18/scratch/users/adamsn23/RSC/seq2022
+
+mkdir $RUN_PATH/OUT/filtered/coverage
+touch $RUN_PATH/OUT/filtered/coverage/covSummary.genomecov.txt
+touch $RUN_PATH/OUT/filtered/coverage/covSummary.genomecov.rm0.txt
+
+
+cd $RUN_PATH/SHELL/coverage
+ls $RUN_PATH/OUT/filtered | grep "bam"| awk -F "." '{print $1}' | grep -v "FC5" | grep "FC" | uniq | while read -r LINE
+do
+
+echo '#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=36G
+#SBATCH -J '$LINE'.coverage
+#SBATCH -o '$RUN_PATH'/QSTAT/filterBAM/'$LINE'.coverage.o
+#SBATCH --error '$RUN_PATH'/QSTAT/filterBAM/'$LINE'.coverage.err
+
+module purge
+module load GCC/8.3.0 OpenMPI/3.1.4 pybedtools/0.8.1 SAMtools/1.15
+
+cd $RUN_PATH/OUT/filtered
+
+ bedtools genomecov -dz -ibam '$RUN_PATH'/OUT/filtered/'$LINE'.pe.sorted.filtered.bam  > '$RUN_PATH'/OUT/filtered/coverage/'$LINE'_cov.genomecov.txt
+ 
+scontrol show job ${SLURM_JOB_ID}' > ./coverage."$LINE".sh
+
+sbatch ./coverage."$LINE".sh
+
+done
+```
+
+&nbsp;
+
+#### Combine coverage output
+```{bash, eval=FALSE}
+awk '{if($3<500) {total+=$3; ++lines}} END {print FILENAME," ",total/lines}' filtered/coverage/*_cov.genomecov.txt >> filtered/coverage/covSummary.genomecov2022.txt
+#cat coverage/"$sample"_cov.genomecov.txt|awk '$3!=0{print$0}'|awk '{if($3<500) {total+=$3; ++lines}} END {print FILENAME," ",total/lines}' coverage/"$sample"_cov.genomecov.txt >> cov/covSummary.genomecov.rm0.txt
+
+#rm coverage/"$sample"_cov.genomecov.txt
+```
