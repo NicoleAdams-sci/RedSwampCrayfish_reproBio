@@ -1,0 +1,1957 @@
+---
+title: "jY22_juvs"
+author: "Nicole Adams"
+date: '2022-08-30'
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+# Analyses with juvenile samples
+This work flow is for analyses with juvenile samples of invasive Red Swamp Crayfish (*P. clarkii*) sequenced in 2021 by Jared Homola and in 2022 by Nicole Adams for juvenile cohort identification, estimates of breeding adults and reproductive success, and pedigree reconstruction. Analyses include: 
+estimated effective number of breeders estimated using NeEstimator (Nb_LD) and Colony (Nb_Wang). Estimates of reconstructed parental genotypes based on the pedigrees without adjustments (NS) and estimates of the asymptotic number (NS_hat) of adults based on the Chao estimate, estimated mean rarefied reproductive success (RS) of contributing adults, and mean offspring coancestry.
+
+&nbsp;
+
+This is for the manuscript Adams NE, Homola JJ, Sard NM, Nathan LR, Roth BM, Robinson JD, Scribner KT. 2024. Genomic data characterize reproductive ecology patterns in Michigan invasive Red Swamp Crayfish (*Procambarus clarkii*). *Evolutionary Applications*. 
+
+&nbsp;
+
+The preceding bioinformatic processing for these files can be found in RSC_genotyping_Jared-seq2022_4ms.Rmd. The original document this Rmd is based on is jY22_juvs.Rmd.
+
+&nbsp;
+
+### Load R libraries
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggrepel)
+library(data.table)
+library(kableExtra)
+library(ggpubr)
+
+library(readxl)
+library(googlesheets4) #access Google drive with RSC sample data see https://www.tidyverse.org/blog/2020/05/googlesheets4-0-2-0/
+library(lubridate)
+
+library(vcfR)
+library(SeqArray)
+library(SNPRelate)
+library(ggdist)
+```
+
+&nbsp;
+
+# Juvenile pedigree reconstruction
+## Filter VCF for only juveniles, add a maf (--maf 0.005) and stricter depth (--minDP 20) filter
+```{bash, eval=FALSE}
+# 1) combine Jared's and seq2022 juvs
+../../SHELL/dependencies/juvs_jY22.txt # 1030
+
+# 2) filter VCF for just juvs
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab.vcf --keep ../../SHELL/dependencies/juvs_jY22.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs.vcf 
+
+egrep -v "^#" filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs.vcf | wc -l # 5307 loci 
+
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64
+
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs.vcf  | wc -l # 902 indiv 
+
+# filter for maf
+# 1030*2 = 2060, 2060*0.005 = 10.3; if set maf to 0.005 an allele would need to show up 10 times
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs.vcf --maf 0.005 --minDP 20 --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.vcf # 2262
+
+```
+
+&nbsp;
+&nbsp;
+
+### Select best SNPs per RAD Tag in R
+Inspiration from Grunwald Lab's [Population Genetics in R tutorial](https://grunwaldlab.github.io/Population_Genetics_in_R/qc.html)
+```{r, message=FALSE, warning=FALSE}
+juvs <- read.vcfR(file="~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.vcf")
+
+juvs.mafA <- as.data.frame(maf(juvs))
+juvs.maf <- juvs.mafA %>% mutate(tag=rownames(juvs.mafA)) %>% separate(tag, into = c("tag", "position", "stuff"), sep = ":") %>% select(-stuff) %>% rename("maf.frq" =Frequency) %>% mutate(position = as.numeric(position)) %>% mutate(tag = as.numeric(tag))
+
+#file <- "~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.vcf"
+#seqVCF2GDS(vcf.fn = file, "~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.gds", verbose = FALSE)
+
+open_GDS <- seqOpen("~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.gds", readonly = TRUE)
+
+# Get sample info
+sample_info <- as.data.frame(read.gdsn(index.gdsn(open_GDS, "sample.id")), quote=FALSE)
+
+# data prep
+tidyJuvs <- vcfR2tidy(juvs)
+
+tmpJuvs <- tidyJuvs$gt %>%  dplyr::select(ChromKey, POS, Indiv, gt_GT)
+
+tmpJuvs2 <- tidyJuvs$fix %>% dplyr::select(ChromKey, CHROM, POS, ID)
+
+# filter positions
+positionFilter <- left_join(tmpJuvs, tmpJuvs2, by = c("ChromKey", "POS")) %>%
+ mutate(population = substr(Indiv, 1, 5)) %>%
+ dplyr::select(CHROM, POS, ID) %>%
+ distinct(ID, .keep_all = TRUE) %>%
+ separate(ID, c("tag", "position", NA)) %>%
+ mutate(position = as.numeric(position)) %>%
+ mutate(tag = as.numeric(tag))
+
+# Get allele depth and maf
+geno_matrixJuvs <-snpgdsGetGeno(open_GDS)
+het_matrix <- geno_matrixJuvs
+het_matrix[which(geno_matrixJuvs != 1)] <- 0
+het_matrix[which(is.na(geno_matrixJuvs))] <- 0
+is.odd <- function(x) x %% 2 != 0
+AD <- seqGetData(open_GDS, "annotation/format/AD") # allelic depth
+AD <- as.data.frame(AD$data)
+alt_c <- AD[,!is.odd(seq(1, ncol(AD), 1))]
+AF <- seqGetData(open_GDS, "annotation/info/AF") # allele freq
+AF <- as.data.frame(AF)
+AF_Miss <- apply(alt_c, MARGIN = 2, function(x){ sum( is.na(x) ) } ) # margin =2 is over columns
+AF_Miss <- AF_Miss / nrow(alt_c)
+
+
+positionFilter2 <- cbind(positionFilter, AF, AF_Miss)
+positionFilter3 <- left_join(positionFilter2, juvs.maf, by=c("tag", "position")) %>% select(-c(nAllele, "NA", Count))
+
+
+# Make a list of markers that pass
+positionFilter4 <- positionFilter3 %>% group_by(tag) %>%
+  filter(AF_Miss == min(AF_Miss)) %>% # 1010 bc tied missing
+  filter(maf.frq == max(maf.frq)) %>%
+  filter(1:n() == 1)  %>%  # take first occurrence 
+  select(CHROM, POS) # adds tag bc group, could use ungroup or just select col 2 and 3
+
+# write.table(positionFilter4[,2:3], "~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.txt",
+#               quote = FALSE,
+#               row.names = FALSE,
+#               col.names = FALSE,
+#               sep = '\t')
+
+```
+
+&nbsp;
+
+### Filter VCF with best SNP per RAD tag and convert to GT format
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.vcf --positions filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf 
+
+egrep -v "^#" filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf  | wc -l # 930 sites 
+
+# Get GT format vcf file
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf --extract-FORMAT-info GT --out filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag
+
+# get list of samples
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64
+
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_IDs.txt #902
+
+```
+
+&nbsp;
+&nbsp;
+
+### Convert GT format VCF to Colony input file format
+I used scripts modified from Ellie's [vcf_colony.R script](https://github.com/weiseell/NbdLamprey/blob/master/Homebrew/vcf_colony.R) to convert VCF in GT format to input format for Colony using the following functions.
+
+&nbsp;
+
+## Modified vcf_colony.R
+John Robinson modified original vcf_colony.R script to include separate entries for candidate moms and dads for RSC
+```{r, message=FALSE, warning=FALSE}
+vcf_colony <- function(vcf,empty = T){
+  #sorting data for COLONY and reformatting genotypes
+  vcf$gt <- gsub(pattern = "1/1",replacement = "2/2",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "0/0",replacement = "1/1",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "0/1",replacement = "1/2",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "\\./\\.",replacement = "0/0",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "NA",replacement = "0/0",x = vcf$gt, fixed = T)
+  
+  #separating genotypes into alleles and then merging them together
+  #allele one
+  a1 <- vcf %>% 
+    separate(col = gt,into = c("a","b"),sep = "/") %>%
+    dplyr::select(-b) %>%
+    spread(key = "locus",value = "a")
+  colnames(a1) <- paste0(colnames(a1),".1")
+  names(a1)[1] <- "id"
+  
+  #allele two
+  a2 <- vcf %>% 
+    separate(col = gt,into = c("a","b"),sep = "/") %>%
+    dplyr::select(-a) %>%
+    spread(key = "locus",value = "b")
+  colnames(a2) <- paste0(colnames(a2),".2")
+  names(a2)[1] <- "id"
+  
+  #merging on IDs
+  colony <- merge(a1,a2,by="id") 
+  colony <- colony %>% dplyr::select(sort(colnames(colony)))
+  
+  if(empty == T){
+    colony1 <- colony %>% 
+      gather(key = locus,value = gt, -id)
+    colony1 <- colony1 %>% 
+      mutate(gtcheck = ifelse(colony1$gt == "0",0,1)) %>% 
+      group_by(id) %>% 
+      summarise(sums = sum(gtcheck),
+                empty = ifelse(sums == 0,T,F))
+    
+    colony$empty <- colony1$empty
+    colony <- colony %>% 
+      filter(empty == F) %>% 
+      dplyr::select(-empty)
+    
+  }
+  colony
+}
+
+marker_create <- function(SNPs,cod = 0,gte = 0.02,ote = 0.001){
+  #making a matrix of zeros of the correct size and adding colnames
+  nmarkers <- (length(SNPs)-1)/2
+  markers  <- data.frame(matrix(data = 0,nrow = 3,ncol = nmarkers))
+  colnames(markers) <- SNPs[seq(from=2, to = nmarkers*2,by = 2)]
+  
+  #filling in matrix
+  markers[1,] <- cod #for co-dominant markers
+  markers[2,] <- gte # genotyping error
+  markers[3,] <- ote #other types of error
+  
+  #output
+  markers
+}
+
+colonydat_create <- function(moms = NA, dads = NA, kids, markers, update.alfs = 0,
+                             spp.type = 2, inbreeding = 0, ploidy = 0, fem.gamy = 1, mal.gamy = 1,
+                             clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 1,
+                             run.length = 2, monitor = 0, windows.version = 0, full.likelihood = 1,
+                             likelihood.precision = 2, prob.mom = 1.0, prob.dad = 1.0,output_file = "colony2.dat"){
+  options(scipen = 999)
+  #getting current working directory and fixing slashes for running on linux
+  my.wd <- "'Input.data'"
+  my.wd2 <- "'Output.data'" 
+  
+  #getting the number of kids, moms, and dads
+  noff1 <- nrow(kids); nmoms <- nrow(moms); ndads <- nrow(dads)
+  noff <- paste(noff1,"! Number of offspring in the sample",sep = "\t")
+  
+  #getting the number of loci
+  nloci <- ncol(markers)
+  nloci <- paste(nloci, "! Number of loci",sep = "\t") 
+  
+  #setting a random number seed
+  random.seed <- round(runif(n = 1,min = 1,max = 9999))
+  random.seed <- paste(random.seed, "! Seed for random number generator",sep = "\t")
+  
+  #adding comments to input parameters
+  update.alfs <- paste(update.alfs,"! Not upate/update allele frequency",sep = "\t")
+  spp.type <- paste(spp.type, "! 2/1=Dioecious/Monoecious",sep = "\t")
+  inbreeding <- paste(inbreeding,"! 0/1=No inbreeding/inbreeding", sep = "\t")
+  ploidy <- paste(ploidy, "! 0/1=Diploid species/HaploDiploid species",sep="\t")
+  gamy <- paste(paste(mal.gamy,fem.gamy),"! 0/1=Polygamy/Monogamy for males & females",sep = "\t")
+  clone <- paste(clone,"! 0/1=Clone inference =No/Yes",sep="\t")
+  sib.scale <- paste(sib.scale,"! 0/1=Scale full sibship=No/Yes",sep = "\t")
+  sib.prior <- paste(sib.prior,"! 0/1/2/3=No sibship prior/Weak sibship prior/Medium sibship prior/Strong sibship prior",sep = "\t")
+  known.alfs <- paste(known.alfs,"! 0/1=Unknown/Known population allele frequency",sep = "\t")
+  run.number <- paste(run.number,"! Number of runs",sep = "\t")
+  run.length <- paste(run.length,"! Length of run",sep = "\t")
+  monitor <- paste(monitor,"! 0/1=Monitor method by Iterate#/Time in second",sep = "\t")
+  monitor.interval <- paste(1000000,"! Monitor interval in Iterate# / in seconds",sep = "\t")
+  windows.version <- paste(windows.version,"! Windows version",sep = "\t")
+  full.likelihood <- paste(full.likelihood,"! Fulllikelihood",sep = "\t")
+  likelihood.precision <- paste(likelihood.precision,"! 1/2/3=low/medium/high Precision for Fulllikelihood",sep = "\t")
+  
+  #collating info for parents
+  if(prob.dad == 0 & prob.mom == 0){
+    probs <- c("0.0","0.0")
+  } else {
+    probs <- c(prob.dad,prob.mom)
+  }
+  
+  npars <- c(0,0)
+  if(!is.na(dads)) {npars[1] <- nrow(dads)}
+  if(!is.na(moms)) {npars[2] <- nrow(moms)}
+  
+  my.value <- paste0(0,"\n")
+  my.exc.value <- paste(0,0,"\n")
+  #making the actual file
+  cat(my.wd,my.wd2,noff,nloci,random.seed, update.alfs,spp.type,
+      inbreeding,ploidy,gamy,clone,sib.scale,sib.prior,
+      known.alfs,run.number,run.length,monitor,monitor.interval,
+      windows.version,full.likelihood,likelihood.precision,file = output_file,sep = "\n",append = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = markers,file = output_file,append = T,quote = F,sep = ",",row.names = F,col.names = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = kids,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  cat("\n",file = output_file,append = T)
+  cat(probs,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(npars,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  if(!is.na(dads) ){
+    cat("\n",file = output_file,append = T)
+    write.table(x = dads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  if(!is.na(moms)){
+    cat("\n",file = output_file,append = T)
+    write.table(x = moms,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+}
+
+```
+
+&nbsp;
+
+## Modified colony_create() add dyads
+John Robinson modified original colony_create function to include dyads for RSC
+```{r, message=FALSE, warning=FALSE}
+colonydat_create2 <- function(moms = NA, dads = NA, kids, dyads, markers, update.alfs = 0,
+                             spp.type = 2, inbreeding = 0, ploidy = 0, fem.gamy = 1, mal.gamy = 1,
+                             clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 1,
+                             run.length = 2, monitor = 0, windows.version = 0, full.likelihood = 1,
+                             likelihood.precision = 2, prob.mom = 1.0, prob.dad = 1.0,output_file = "colony2.dat"){
+  options(scipen = 999)
+  #getting current working directory and fixing slashes for running on linux
+  my.wd <- "'Input.data'"
+  my.wd2 <- "'Output.data'" 
+  
+  #getting the number of kids, moms, and dads
+  noff1 <- nrow(kids); nmoms <- nrow(moms); ndads <- nrow(dads)
+  noff <- paste(noff1,"! Number of offspring in the sample",sep = "\t")
+  
+  #getting the number of loci
+  nloci <- ncol(markers)
+  nloci <- paste(nloci, "! Number of loci",sep = "\t") 
+  
+  #getting the number of maternity dyads (NEA)
+  ndyads <- nrow(dyads)
+  ndyads <- paste(ndyads, "! Number of offspring with known mother",sep = "\t") 
+    
+  #setting a random number seed
+  random.seed <- round(runif(n = 1,min = 1,max = 9999))
+  random.seed <- paste(random.seed, "! Seed for random number generator",sep = "\t")
+  
+  #adding comments to input parameters
+  update.alfs <- paste(update.alfs,"! Not upate/update allele frequency",sep = "\t")
+  spp.type <- paste(spp.type, "! 2/1=Dioecious/Monoecious",sep = "\t")
+  inbreeding <- paste(inbreeding,"! 0/1=No inbreeding/inbreeding", sep = "\t")
+  ploidy <- paste(ploidy, "! 0/1=Diploid species/HaploDiploid species",sep="\t")
+  gamy <- paste(paste(mal.gamy,fem.gamy),"! 0/1=Polygamy/Monogamy for males & females",sep = "\t")
+  clone <- paste(clone,"! 0/1=Clone inference =No/Yes",sep="\t")
+  sib.scale <- paste(sib.scale,"! 0/1=Scale full sibship=No/Yes",sep = "\t")
+  sib.prior <- paste(sib.prior,"! 0/1/2/3=No sibship prior/Weak sibship prior/Medium sibship prior/Strong sibship prior",sep = "\t")
+  known.alfs <- paste(known.alfs,"! 0/1=Unknown/Known population allele frequency",sep = "\t")
+  run.number <- paste(run.number,"! Number of runs",sep = "\t")
+  run.length <- paste(run.length,"! Length of run",sep = "\t")
+  monitor <- paste(monitor,"! 0/1=Monitor method by Iterate#/Time in second",sep = "\t")
+  monitor.interval <- paste(1000000,"! Monitor interval in Iterate# / in seconds",sep = "\t")
+  windows.version <- paste(windows.version,"! Windows version",sep = "\t")
+  full.likelihood <- paste(full.likelihood,"! Fulllikelihood",sep = "\t")
+  likelihood.precision <- paste(likelihood.precision,"! 1/2/3=low/medium/high Precision for Fulllikelihood",sep = "\t")
+  
+  #collating info for parents
+  if(prob.dad == 0 & prob.mom == 0){
+    probs <- c("0.0","0.0")
+  } else {
+    probs <- c(prob.dad,prob.mom)
+  }
+  
+  npars <- c(0,0)
+  if(!is.na(dads)) {npars[1] <- nrow(dads)}
+  if(!is.na(moms)) {npars[2] <- nrow(moms)}
+  
+  my.value <- paste0(0,"\n")
+  my.exc.value <- paste(0,0,"\n")
+  #making the actual file
+  cat(my.wd,my.wd2,noff,nloci,random.seed, update.alfs,spp.type,
+      inbreeding,ploidy,gamy,clone,sib.scale,sib.prior,
+      known.alfs,run.number,run.length,monitor,monitor.interval,
+      windows.version,full.likelihood,likelihood.precision,file = output_file,sep = "\n",append = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = markers,file = output_file,append = T,quote = F,sep = ",",row.names = F,col.names = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = kids,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  cat("\n",file = output_file,append = T)
+  cat(probs,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(npars,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  if(!is.na(dads) ){
+    cat("\n",file = output_file,append = T)
+    write.table(x = dads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  if(!is.na(moms)){
+    cat("\n",file = output_file,append = T)
+    write.table(x = moms,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  if(!is.na(dyads)){
+    cat("\n",file = output_file,append = T)
+    write.table(x = dyads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+}
+
+```
+
+&nbsp;
+
+## Convert juvenile data to Colony format by population  
+*Warning: if run more than once colonyDat_create() will append file to existing file*
+```{r, message=FALSE, warning=FALSE}
+# Load in data
+juvs <- read_delim("~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.GT.FORMAT", delim = "\t") 
+
+juvs2 <- juvs %>% pivot_longer(cols = 3:904,  
+                             names_to = "ind", 
+                             values_to = "gt") %>%  
+  mutate(locusA = paste0(CHROM,POS)) %>% 
+  mutate(locus = paste0("L", as.numeric(as.factor(locusA)))) %>% # better way to do this?
+  select(locus, ind, gt) 
+
+colony.j.list <- list()
+for (POP in c("FC12", "FC17b", "MB1", "SHD")) {
+  jName <- paste('colonyDat', POP, 'j', sep = '.' )
+  dat.pop <- juvs2 %>% filter(grepl(POP, ind))
+  j.dat <- dat.pop %>% filter(grepl('J', ind))
+  colony.j.list[[ jName ]] <- vcf_colony(j.dat)
+}
+
+markers.juvs <- marker_create(unique(juvs2$locus), cod = 0, gte = 0.01, ote = 0.001) 
+
+ # colonydat_create(moms = NA, dads = NA, kids=colony.j.list$colonyDat.FC12.j, markers=markers.juvs, update.alfs = 0,
+ #                               spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+ #                               clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+ #                               run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+ #                               likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+ #                               output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.FC12.dat")
+ # 
+ # colonydat_create(moms = NA, dads = NA, kids=colony.j.list$colonyDat.FC17b.j, markers=markers.juvs, update.alfs = 0,
+ #                  spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+ #                  clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+ #                  run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+ #                  likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+ #                  output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.FC17b.dat")
+ # 
+ # colonydat_create(moms = NA, dads = NA, kids=colony.j.list$colonyDat.MB1.j, markers=markers.juvs, update.alfs = 0,
+ #                               spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+ #                               clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+ #                               run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+ #                               likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+ #                               output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.MB1.dat")
+ # 
+ # colonydat_create(moms = NA, dads = NA, kids=colony.j.list$colonyDat.SHD.j, markers=markers.juvs, update.alfs = 0,
+ #                  spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+ #                  clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+ #                  run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+ #                  likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+ #                  output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.SHD.dat")
+
+
+
+## get FC12 and FC17b combined
+colony.j.list2 <- list()
+for (POP in c("FC")) {
+  jName <- paste('colonyDat', POP, 'j', sep = '.' )
+  dat.pop <- juvs2 %>% filter(grepl(POP, ind))
+  j.dat <- dat.pop %>% filter(grepl('J', ind))
+  colony.j.list2[[ jName ]] <- vcf_colony(j.dat)
+}
+
+ # colonydat_create(moms = NA, dads = NA, kids=colony.j.list2$colonyDat.FC.j, markers=markers.juvs, update.alfs = 0,
+ #                  spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+ #                  clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+ #                  run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+ #                  likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+ #                  output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.FC12yFC17b.dat")
+
+```
+
+&nbsp;
+
+## Run juveniles through Colony per population
+(/mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/scripts/colony.sbatch)
+```{bash, eval=FALSE}
+#!/bin/sh
+#SBATCH --ntasks=1
+#SBATCH -t 12:00:00
+#SBATCH -N 1 -c 8
+#SBATCH --mem 30G
+#SBATCH -J colony
+##SBATCH -o '$RUN_PATH'/colony.'$POP'.o
+#SBATCH --output=colony.%j.out
+#SBATCH --error=colony.%j.err
+#SBATCH --mail-type=END
+#SBATCH --mail-user=
+
+FILE=$1
+POP=$2
+
+## A pop with 507 samples took ~24 hours
+
+##loading modules (Modules and Colony on HPCC)
+module purge
+ml -* icc/2018.1.163-GCC-6.4.0-2.28  impi/2018.1.163  COLONY/2.0.6.7
+
+#Where you want to run colony for all your runs (if coped over all .dat files from a single directory)
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/OUT/genotyped/juvs
+
+#Where your colony path is located (or where ever you copy your .dat files to)
+#cd '$RUN_PATH'/COLONY/
+
+#creates a folder for each population
+mkdir "$POP"
+
+#Copies colony.dat file to new population folder (if in main folder). Be sure to rename your .Dat files accordingly (name should match POP name)
+cp "$FILE" "$POP"
+
+#Directs command line to the population folder once .DAT file has been moved
+cd $RUN_PATH/$POP
+
+#Runs COLONY based in the above redirect
+mpirun -n 8 colony2p IFN:$FILE
+#mpirun -n 8 colony2p IFN:colony2.mdl.SHD_dyad.dat
+
+#Outputs diagnostic file to a desired location
+#scontrol show job ${SLURM_JOB_ID}' > $RUN_PATH/SHELL/colony."$POP".sh
+
+#sbatch $RUN_PATH/SHELL/colony."$POP".sh
+
+# rename output	files with a population	tag
+for OUT in Output*; do mv $OUT "${OUT}_$POP"; done
+```
+
+&nbsp;
+
+#### Loop over all 4 populations
+```{bash, eval=FALSE}
+for FILE in `ls *.dat`; do POP=`ls $FILE | cut -f3 -d"."`; echo $FILE; echo $POP; sbatch ../../../scripts/colony.sbatch $FILE $POP; done 
+
+```
+
+&nbsp;
+
+## Get collection date information for juveniles
+```{r, message=FALSE, warning=FALSE}
+juvs.sa <- read.delim("~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_IDs.txt", header = F)
+
+juvs.2022 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/juv2022_meta.txt", header = T)
+juvs.2022 <- juvs.2022 %>% dplyr::select(-c(Month, Mom, Storage_location, ExtractedDate, Juv., Extracted.DNA.location, library))
+juvs.2022 <- juvs.2022 %>% mutate(DateFinal = paste0(Date2, "-2021"))
+juvs.2022$DateFinal <- lubridate::mdy(juvs.2022$DateFinal)
+  
+juvs.2020 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/juv2020_meta.txt", header = T)
+juvs.2020 <- juvs.2020 %>% mutate(SequenceID=Sample_ID)
+juvs.2020 <- juvs.2020 %>% mutate(DateFinal = paste0(Date2, "-2020"))
+juvs.2020$DateFinal <- lubridate::mdy(juvs.2020$DateFinal)
+
+juvs.meta <- rbind(juvs.2020, juvs.2022)
+
+juvs4colony <- juvs.meta %>% filter(SequenceID %in% juvs.sa$V1) # should be 902
+
+juvs4colony <- juvs4colony %>% mutate(DateFull=paste0(Date,sep="/", Year))
+
+# write.table(juvs4colony, "~/Documents/crayfish_lab/jaredYseq2022/juvs/juvs4colony.txt",
+#               quote = FALSE,
+#               row.names = FALSE,
+#               col.names = TRUE,
+#               sep = '\t')
+
+# write.table(juvs.meta, "~/Documents/crayfish_lab/jaredYseq2022/juvs/juvs4sampleTable.txt",
+#               quote = FALSE,
+#               row.names = FALSE,
+#               col.names = TRUE,
+#               sep = '\t')
+```
+
+&nbsp;
+
+## Colony results
+Read Colony results into R
+```{r, message=FALSE, warning=FALSE}
+# load in BestFSFamily files 
+bfs.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs", pattern='Output.data.BestFSFamily*', full.names = T)
+
+bfs.list <- list()
+for (FILE in bfs.files){
+  bfs.df <- as.data.frame(fread(FILE))
+  pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(12)]
+  dfName <- paste( pop, 'df', sep = '.' )
+  
+  members <- str_split(names(bfs.df)[[4]], '[,]+')
+  members <- unlist(members)
+  
+  bfs.df2 <- bfs.df %>% separate(names(.)[[4]], into = members, sep = ",")
+  
+  bfs.df2 <- bfs.df2 %>% arrange(desc(`Prob(Inc.)`), desc(`Prob(Exc.)`))
+
+  bfs.list[[dfName]] <- bfs.df2
+}
+
+# write.table(bfs.list$FC17b.df, "~/Documents/crayfish_lab/jaredYseq2022/juvs/FC17b_fullSibs.txt",
+#               quote = FALSE,
+#               row.names = FALSE,
+#               col.names = TRUE,
+#               sep = '\t')
+```
+
+&nbsp;
+
+### Function to format Colony results with date collected metadata
+```{r, message=FALSE, warning=FALSE}
+# build function so can do for all pops
+fun.test <- function(df) {
+  mem.list <- c()
+  for (MEM in 4:ncol(df)) {
+    MEMBER <- paste0("Member", (MEM-3))
+    DATE <- paste0("Datex", (MEM-3))
+    #date.df <- juvs4colony %>% filter(SequenceID %in% bfs.list$FC17b[, MEM]) %>% mutate({{DATE}}:=DateFull) %>% select(Sample_ID, SequenceID, DATE)  %>% mutate({{MEMBER}}:=SequenceID)
+    date.df <- juvs4colony %>% filter(SequenceID %in% df[, MEM])
+    date.df[[DATE]] <- date.df$DateFull
+    date.df[[MEMBER]] <- date.df$SequenceID
+    date.df2 <- date.df %>% dplyr::select(-c(Site, Site_Abbrev, Ind., Sex, Carap_mm, Date, Year, ND_conc, Seq_library, Tissue_location, Extracted_DNA_location, Notes, SuccessfulGenotype2020, Date2, stage, DateFull)) 
+    date.df3 <- left_join(df, date.df2)
+    #date.df3[, ncol(date.df3) + 1] <- date.df3 %>% select(-c(Sample_ID, SequenceID))
+    mem.list[[MEMBER]] <- date.df3
+    rm(date.df, date.df2, date.df3)
+  }
+  return(mem.list)
+}
+
+# example for fun.test2
+# fs.FC12 <- fun.test(bfs.list$FC12.df)
+# fs.FC12.dfA <- do.call(cbind, lapply(fs.FC12, function(x) x[ , ncol(x), drop=FALSE]))
+# fs.FC12.df <- cbind(fs.FC12$Member1 %>% select(-Datex1), fs.FC12.dfA)
+# fs.FC12.df <- fs.FC12.df %>% select(-Sample_ID, -SequenceID)
+# fs.FC12.df %>% filter(!is.na(Datex2))
+
+fun.test2 <- function(df) {
+ fs <- fun.test(df)
+  fs.dfA <- do.call(cbind, lapply(fs, function(x) x[ , ncol(x), drop=FALSE]))
+  fs.df <- cbind(fs$Member1 %>% dplyr::select(-Datex1), fs.dfA)
+  fs.df <- fs.df %>% dplyr::select(-Sample_ID, -SequenceID)
+  fs.df %>% filter(!is.na(Datex2))
+  fs.df
+}
+
+```
+
+&nbsp;
+
+### Plot Colony results - carap length vs full sib grp, colored by date
+```{r, message=FALSE, warning=FALSE}
+# Plot FS groups and carapace
+
+# Define population dataframes 
+fs.FC12.df <- fun.test2(bfs.list$FC12.df)
+fs.FC17b.df <- fun.test2(bfs.list$FC17b.df)
+fs.MB1.df <- fun.test2(bfs.list$MB1.df)
+fs.SHD.df <- fun.test2(bfs.list$SHD.df)
+
+
+# Define collected dates as factor levels
+FC12.lev <- c("8/27/2020", "9/18/2020", "9/22/2020", "10/01/2020", "10/20/2020", "5/12/21/2021", "5/12-5/19/2021", "5/21-5/25/2021", "6/4/21/2021", "6/8/2021", "06/18/2021", "06/22/2021", "6/29/21/2021")
+
+# Remove full sibling groups with only one individual
+FC12.lev.s <- c( "10/20/2020", "5/12/21/2021", "5/12-5/19/2021", "5/21-5/25/2021", "6/4/21/2021", "6/8/2021", "06/18/2021")
+
+# Repeat for all populations
+#FC17
+FC17b.lev <- c("8/25/2020", "8/26/2020", "8/27/2020", "8/28/2020", "09/01/2020", "9/2/2020", "9/4/2020", "9/8/2020", "9/9/2020", "9/14/2020", "9/15/2020", "9/16/2020", "9/18/2020", "9/21/2020", "9/22/2020", "9/23/2020", "9/24/2020",  "9/25/2020", "9/28-10/2/2020", "10/5-10/9/2020", "10/13-10/16/2020", "5/24-5/25/2021", "6/01-6/04/2021", "6/8/21/2021")
+
+# remove single fs groups
+FC17b.lev.s <-  c("8/25/2020", "8/27/2020", "8/28/2020", "09/01/2020", "9/4/2020", "9/8/2020", "9/9/2020", "9/14/2020", "9/16/2020", "9/18/2020", "9/21/2020", "9/22/2020", "9/23/2020", "9/24/2020", "9/28-10/2/2020", "10/5-10/9/2020", "10/13-10/16/2020", "5/24-5/25/2021", "6/01-6/04/2021", "6/8/21/2021")
+
+
+#MB1
+MB1.lev <- c("8/17/2020", "8/24/2020", "8/31-9/4/2020", "9/8-9/11/2020", "9/28/2020", "5/10-5/15/2021", "5/17-5/21/2021", "5/24-5/28/2021", "06/01/2021", "06/07/2021", "7/6/21/2021", "10/04/2021", "10/5/21/2021", "10/20/21/2021", "10/20/2021")
+
+# remove single fs groups
+MB1.lev.s <-  c("8/17/2020", "8/24/2020", "8/31-9/4/2020", "9/8-9/11/2020", "9/28/2020", "5/10-5/15/2021", "5/17-5/21/2021", "5/24-5/28/2021", "06/01/2021",  "06/07/2021", "7/6/21/2021", "10/04/2021", "10/5/21/2021")
+
+
+#SHD
+SHD.lev <- c("8/17/2020", "8/24/2020", "8/31-9/4/2020", "9/8-9/11/2020", "9/14-9/18/2020", "5/10-5/15/2021", "5/17-5/21/2021", "5/24/2021", "8/30/2021",  "9/8/2021", "9/9/2021", "9/20-9/24/2021", "9/30/2021", "9/27-10/1/2021", "10/4-10/9/2021","10/5/2021", "10/8/2021", "10/11-10/16/2021", "10/14/2021", "10/18-10/22/2021", "10/21/2021", "10/26/2021", "10/29/2021")
+
+# remove single fs groups
+SHD.lev.s <-  c("8/17/2020", "8/24/2020", "8/31-9/4/2020", "9/8-9/11/2020", "9/14-9/18/2020", "5/10-5/15/2021", "5/17-5/21/2021", "8/30/2021",  "9/8/2021", "9/9/2021", "9/20-9/24/2021", "9/30/2021", "9/27-10/1/2021", "10/4-10/9/2021","10/5/2021", "10/8/2021", "10/11-10/16/2021", "10/14/2021", "10/18-10/22/2021", "10/21/2021", "10/26/2021", "10/29/2021")
+
+
+
+# Function to plot carapace vs full sib groups color by date collected - and remove fs groups with single individuals and re plot
+fs.plot.fn <- function (fs.df, fs.levs, fs.levs.s) {
+  fs.list <- c()
+  pop <- unlist(strsplit(deparse(substitute(fs.df)), "[.]"))[2]
+  plt.nm1 <- paste0(pop, ".plot")
+  plt.nm2 <- paste0(pop, ".s.plot")
+  df.nm1 <- paste0(pop, "fs.df.dist")
+  df.nm2 <- paste0(pop, "fs.df.dist.s")
+  fs.dfxx <- pivot_longer(fs.df, cols = names(fs.df %>% dplyr::select(contains("Member"))), names_to = "Member", values_to = "SequenceID")
+  fs.df.dist <- left_join(fs.dfxx, juvs4colony, by=c("SequenceID")) %>% filter(!is.na(SequenceID))
+  fs.df.dist$DateFull <- factor(fs.df.dist$DateFull, levels = fs.levs)
+  
+  fs.list[[plt.nm1]] <- ggplot(fs.df.dist, aes(x=FullSibshipIndex, y=Carap_mm, color=DateFull)) +
+  geom_point(size=6, alpha=0.5) + #geom_boxplot(aes(group=FullSibshipIndex), color="black") +
+  xlab("FullSibGroup") + ggtitle(pop) + scale_color_viridis_d() +
+  theme_bw() + theme(text = element_text(size=20))
+  
+  fs.list[[df.nm1]] <- fs.df.dist
+  
+  # remove fs groups with single indiv and replot
+  fs.df.dist.s <- fs.df.dist %>% group_by(FullSibshipIndex) %>% filter(n() != 1) %>% ungroup()
+  fs.df.dist.s$DateFull <- factor(fs.df.dist.s$DateFull, levels = fs.levs.s)
+ 
+  fs.list[[plt.nm2]] <- ggplot(fs.df.dist.s, aes(x=FullSibshipIndex, y=Carap_mm, color=DateFull)) +
+  geom_point(size=6, alpha=0.5) + geom_boxplot(aes(group=FullSibshipIndex), color="black") +
+  xlab("FullSibGroup") + ggtitle(paste0(pop, ".s")) + scale_color_viridis_d() +
+  theme_bw() + theme(text = element_text(size=20))
+  
+  fs.list[[df.nm2]] <- fs.df.dist.s
+  
+  return(fs.list)
+  
+}
+
+# Run the function to plot
+FC12.fs.plot <- fs.plot.fn(fs.FC12.df, FC12.lev, FC12.lev.s)
+FC17b.fs.plot <- fs.plot.fn(fs.FC17b.df, FC17b.lev, FC17b.lev.s)
+MB1.fs.plot <- fs.plot.fn(fs.MB1.df, MB1.lev, MB1.lev.s)
+SHD.fs.plot <- fs.plot.fn(fs.SHD.df, SHD.lev, SHD.lev.s)
+
+```
+
+&nbsp;
+
+### Plot Colony results - carap length vs full sib grp, colored by date 2 - in groups
+**Figure 2**
+```{r, message=FALSE, warning=FALSE}
+# Define datasets
+fs.FC12.df.dist2 <- FC12.fs.plot$FC12fs.df.dist
+fs.FC17b.df.dist2 <- FC17b.fs.plot$FC17bfs.df.dist
+fs.MB1.df.dist2 <- MB1.fs.plot$MB1fs.df.dist
+fs.SHD.df.dist2 <- SHD.fs.plot$SHDfs.df.dist
+
+# Group collection dates into months
+# FC12 groups 
+fs.FC12.df.dist2$DateGrp <- ifelse(fs.FC12.df.dist2$DateFull %in% c("8/27/2020"), "Aug2020", "foo")
+fs.FC12.df.dist2$DateGrp <- ifelse(fs.FC12.df.dist2$DateFull %in% c("9/18/2020", "9/22/2020"), "Sept2020", fs.FC12.df.dist2$DateGrp)
+fs.FC12.df.dist2$DateGrp <- ifelse(fs.FC12.df.dist2$DateFull %in% c("10/01/2020", "10/20/2020"), "Oct2020", fs.FC12.df.dist2$DateGrp)
+fs.FC12.df.dist2$DateGrp <- ifelse(fs.FC12.df.dist2$DateFull %in% c("5/12/21/2021",  "5/12-5/19/2021", "5/21-5/25/2021"), "May2021", fs.FC12.df.dist2$DateGrp)
+fs.FC12.df.dist2$DateGrp <- ifelse(fs.FC12.df.dist2$DateFull %in% c("6/4/21/2021", "6/8/2021", "06/18/2021", "06/22/2021", "6/29/21/2021"), "June2021", fs.FC12.df.dist2$DateGrp)
+FC12.Grp.levs <- c("Aug2020", "Sept2020", "Oct2020", "May2021", "June2021")
+
+
+# FC17b groups
+fs.FC17b.df.dist2$DateGrp <- ifelse(fs.FC17b.df.dist2$DateFull %in% c("8/25/2020", "8/26/2020", "8/27/2020", "8/28/2020"), "Aug2020", "foo")
+fs.FC17b.df.dist2$DateGrp <- ifelse(fs.FC17b.df.dist2$DateFull %in% c("09/01/2020", "9/2/2020", "9/4/2020", "9/8/2020", "9/9/2020", "9/14/2020", "9/15/2020", "9/16/2020", "9/18/2020", "9/21/2020", "9/22/2020", "9/23/2020", "9/24/2020",  "9/25/2020", "9/28-10/2/2020"), "Sept2020", fs.FC17b.df.dist2$DateGrp)
+fs.FC17b.df.dist2$DateGrp <- ifelse(fs.FC17b.df.dist2$DateFull %in% c("10/5-10/9/2020", "10/13-10/16/2020"), "Oct2020", fs.FC17b.df.dist2$DateGrp)
+fs.FC17b.df.dist2$DateGrp <- ifelse(fs.FC17b.df.dist2$DateFull %in% c("5/24-5/25/2021"), "May2021", fs.FC17b.df.dist2$DateGrp)
+fs.FC17b.df.dist2$DateGrp <- ifelse(fs.FC17b.df.dist2$DateFull %in% c("6/01-6/04/2021", "6/8/21/2021"), "June2021", fs.FC17b.df.dist2$DateGrp)
+FC17b.Grp.levs <- c("Aug2020", "Sept2020", "Oct2020", "May2021", "June2021")
+
+# MB1 groups
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("8/17/2020", "8/24/2020", "8/31-9/4/2020"), "Aug2020", "foo")
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("9/8-9/11/2020", "9/28/2020"), "Sept2020", fs.MB1.df.dist2$DateGrp)
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("5/10-5/15/2021", "5/17-5/21/2021", "5/24-5/28/2021"), "May2021", fs.MB1.df.dist2$DateGrp)
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("06/01/2021", "06/07/2021", "7/6/21/2021"), "June2021", fs.MB1.df.dist2$DateGrp)
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("7/6/21/2021"), "July2021", fs.MB1.df.dist2$DateGrp)
+fs.MB1.df.dist2$DateGrp <- ifelse(fs.MB1.df.dist2$DateFull %in% c("10/04/2021", "10/5/21/2021", "10/20/21/2021", "10/20/2021"), "Oct2021", fs.MB1.df.dist2$DateGrp)
+MB1.Grp.levs <- c("Aug2020", "Sept2020", "May2021", "June2021", "July2021","Oct2021")
+
+# SHD groups
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("8/17/2020", "8/24/2020", "8/31-9/4/2020"), "Aug2020", "foo")
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("9/8-9/11/2020", "9/14-9/18/2020"), "Sept2020", fs.SHD.df.dist2$DateGrp)
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("5/10-5/15/2021", "5/17-5/21/2021", "5/24/2021"), "May2021", fs.SHD.df.dist2$DateGrp)
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("8/30/2021"), "Aug2021", fs.SHD.df.dist2$DateGrp)
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("9/8/2021", "9/9/2021", "9/20-9/24/2021", "9/30/2021", "9/27-10/1/2021"), "Sept2021", fs.SHD.df.dist2$DateGrp)
+fs.SHD.df.dist2$DateGrp <- ifelse(fs.SHD.df.dist2$DateFull %in% c("10/4-10/9/2021","10/5/2021", "10/8/2021", "10/11-10/16/2021", "10/14/2021", "10/18-10/22/2021", "10/21/2021", "10/26/2021", "10/29/2021"), "Oct2021", fs.SHD.df.dist2$DateGrp)
+SHD.Grp.levs <- c("Aug2020", "Sept2020", "May2021", "Aug2021", "Sept2021", "Oct2021")
+
+
+cols <- c("Aug2020"="cadetblue2", "Sept2020"="royalblue2", "Oct2020"="midnightblue", "May2021"="#B2DF8A", "June2021"="green2", "July2021"="darkgreen", "Aug2021"="peachpuff", "Sept2021"="darkorange", "Oct2021"="sienna")
+
+date_lvls <- c("Aug2020", "Sept2020", "Oct2020", "May2021", "June2021", "July2021", "Aug2021", "Sept2021", "Oct2021")
+my_scale <- scale_colour_manual(values=cols, limits=date_lvls, name="Date collected", drop=FALSE)
+
+fs.plot.fn2 <- function (fs.df2, fs.grp.levs) {
+  fs.list2 <- c()
+  pop <- unlist(strsplit(deparse(substitute(fs.df2)), "[.]"))[2]
+  plt.nm1 <- paste0(pop, ".plot")
+  plt.nm2 <- paste0(pop, ".s.plot")
+  plt.nm3 <- paste0(pop, ".s.tufte.plot")
+  plt.nm3b <- paste0(pop, ".s.filt.tufte.plot")
+  plt.nm4 <- paste0(pop, ".s.date.plot")
+  plt.nm5 <- paste0(pop, ".s.dateLines.plot")
+  df.nm1 <- paste0(pop, "fs.df.dist")
+  df.nm2 <- paste0(pop, "fs.df.dist.s")
+  
+  if (pop == "FC12") { renam <- "EastGC2" }
+  if (pop == "FC16") { renam <- "EastGC1" }
+  if (pop == "FC17b") { renam <- "EastGC4" }
+  if (pop == "MB1") { renam <- "WestGC1" }
+  if (pop == "SHD") { renam <- "Hotel1" }
+  
+  fs.df2$DateGrp <- factor(fs.df2$DateGrp, levels = fs.grp.levs)
+  
+  fs.list2[[plt.nm1]] <- ggplot(fs.df2, aes(x=FullSibshipIndex, y=Carap_mm, color=DateGrp)) +
+  geom_point(size=6, alpha=0.5) + #geom_boxplot(aes(group=FullSibshipIndex), color="black") +
+  xlab("FullSibGroup") + ggtitle(renam) +
+    #scale_color_viridis_d() +
+    scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20))
+  
+  # remove fs groups with single indiv and replot
+  fs.df2.s <- fs.df2 %>% group_by(FullSibshipIndex) %>% filter(n() != 1) %>% ungroup()
+ 
+  # boxplot
+  fs.list2[[plt.nm2]] <- ggplot(fs.df2.s, aes(x=FullSibshipIndex, y=Carap_mm, color=DateGrp)) +
+  geom_point(size=3.5, alpha=0.65) + geom_boxplot(aes(group=FullSibshipIndex), color="black") +
+  xlab("FullSibGroup") + ggtitle(paste0(renam, ".s")) +
+    #scale_color_viridis_d() +
+    scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20))
+  
+  fs.list2[[df.nm1]] <-fs.df2
+  
+  # alt plot - Tufte's box plot
+  fs.list2[[plt.nm3]] <- ggplot(fs.df2.s, aes(x=as.factor(FullSibshipIndex), y=Carap_mm, color=as.factor(DateGrp), group=as.factor(FullSibshipIndex))) +
+  geom_point(size=3.5, alpha=0.65) + ggthemes::geom_tufteboxplot(color="black") +
+  xlab("FullSibGroup") + ggtitle(paste0(renam, ".s.tufte")) +
+    #scale_color_viridis_d() +
+    scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20), legend.title = element_blank(), legend.position = "bottom", legend.justification = "right") + guides(color=guide_legend(ncol=3))
+  
+  # alt plot - Tufte's box plot - rm quants for groups with < 3 indivs
+  group_counts <- fs.df2.s %>% group_by(FullSibshipIndex) %>% summarise(count = n())
+  group_counts3 <- group_counts %>% filter(count >=3)
+  filtered_data <- fs.df2.s %>% filter(FullSibshipIndex %in% group_counts3$FullSibshipIndex)
+  fs.list2[[plt.nm3b]] <- ggplot(fs.df2.s, aes(x=as.factor(FullSibshipIndex), y=Carap_mm, color=as.factor(DateGrp))) +
+  geom_point(size=3.5, alpha=0.65) +
+    ggthemes::geom_tufteboxplot(data = filtered_data, color="black") +
+  xlab("FullSibGroup") + ggtitle(paste0(renam, ".s.tufte")) +
+    #scale_color_viridis_d() +
+    scale_color_manual(values = cols, drop = FALSE) +
+  theme_bw() + theme(text = element_text(size=20), legend.title = element_blank(), legend.position = "bottom", legend.justification = "right") + guides(color=guide_legend(ncol=3))
+  
+  # alt plot2 - xaxis date, color fs groups
+  fs.list2[[plt.nm4]] <- ggplot(fs.df2.s, aes(x=DateGrp, y=Carap_mm, color=as.factor(FullSibshipIndex))) +
+  geom_point(size=3.5, alpha=0.65, show.legend = T) + ggthemes::geom_tufteboxplot(aes(group=DateGrp), color="black") +
+  xlab("Collection Date") + ggtitle(paste0(renam, ".s")) +
+    #scale_color_viridis_d() +
+    scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20), legend.position = "bottom")
+  
+  # alt plot3 - xaxis date, color fs groups connect with line, only show fs groups with more than one date
+  dupA <- fs.df2.s %>% group_by(FullSibshipIndex, DateGrp) %>% tally() 
+  dupB <- duplicated(dupA$FullSibshipIndex) | duplicated(dupA$FullSibshipIndex, fromLast = TRUE)
+  dupC <- dupA[dupB, ]
+  fs.df2.s2 <- fs.df2.s %>% filter(FullSibshipIndex %in% dupC$FullSibshipIndex)
+  chaos <- fs.df2.s2 %>% group_by(DateGrp, FullSibshipIndex) %>% summarise(meanC=mean(Carap_mm), sdC=sd(Carap_mm))
+  
+  fs.list2[[plt.nm5]] <- ggplot(chaos, aes(x=DateGrp, y=meanC, color=as.factor(FullSibshipIndex))) +
+  geom_point(size=3.5, alpha=0.65, show.legend = T) +
+    geom_line(aes(group=FullSibshipIndex), linetype="solid") +
+    #geom_pointrange(aes(ymin=meanC-sdC, ymax=meanC+sdC))
+    #geom_errorbar(aes(ymin=meanC-sdC, ymax=meanC+sdC), width=.2, position=position_dodge(0.05)) +
+  xlab("Collection Date") + ylab("Mean carapace length (mm)") + ggtitle(paste0(renam)) +
+    guides(color=guide_legend(title="Full sibling group")) +
+    scale_color_viridis_d(option = "inferno", end=0.95) +
+    #scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20), legend.position = "bottom")
+  
+  
+  return(fs.list2)
+  
+}
+
+FC12.fs.plot2 <- fs.plot.fn2(fs.FC12.df.dist2, FC12.Grp.levs)
+FC17b.fs.plot2 <- fs.plot.fn2(fs.FC17b.df.dist2, FC17b.Grp.levs)
+MB1.fs.plot2 <- fs.plot.fn2(fs.MB1.df.dist2, MB1.Grp.levs)
+SHD.fs.plot2 <- fs.plot.fn2(fs.SHD.df.dist2, SHD.Grp.levs)
+
+FCcom.fs.plot2 <- rbind(FC12.fs.plot2$FC12fs.df.dist, FC17b.fs.plot2$FC17bfs.df.dist %>% dplyr::select(-c(Datex4, Datex5)))
+
+
+####### FIGURE 2A #######
+cohort4report3 <- ggarrange(FC12.fs.plot2$FC12.s.filt.tufte.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none") + ggtitle("EastGC2") + my_scale,
+          FC17b.fs.plot2$FC17b.s.filt.tufte.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none") + ggtitle("EastGC4")+ my_scale,
+          MB1.fs.plot2$MB1.s.filt.tufte.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none") +   
+            ggtitle("WestGC1") + my_scale,
+          SHD.fs.plot2$SHD.s.filt.tufte.plot + theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "none") +
+            ggtitle("Hotel1")+ my_scale, ncol=1, common.legend = TRUE, legend = "bottom")
+
+
+all4legA <- full_join(FC12.fs.plot2$FC12fs.df.dist, FC17b.fs.plot2$FC17bfs.df.dist)
+all4legB <- full_join(MB1.fs.plot2$MB1fs.df.dist, all4legA)
+all4leg <- full_join(SHD.fs.plot2$SHDfs.df.dist, all4legB)
+all4leg$DateGrp <- factor(all4leg$DateGrp, levels = c("Aug2020", "Sept2020", "Oct2020", "May2021", "June2021", "July2021", "Aug2021", "Sept2021", "Oct2021"))
+
+all4leg.p <- ggplot(all4leg, aes(x=FullSibshipIndex, y=Carap_mm, color=DateGrp)) +
+  geom_point(size=3.5, alpha=0.65) +
+  scale_color_manual(values = cols, "Collection date") +
+  theme_bw() +
+  theme(text = element_text(size=20), legend.title = element_text(size = 16), legend.position = "bottom", legend.justification = "right") + guides(color=guide_legend(ncol=3, title.position="top", title.hjust = 0.95)) +
+  facet_wrap(~Site_Abbrev, ncol=1)
+  
+
+#function to extract the legend of a ggplot; source:
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+get_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+leggy <- get_legend(all4leg.p)
+cohort4report3_ann <- annotate_figure(cohort4report3, left = grid::textGrob("Carapace length (mm)", rot = 90, gp = grid::gpar(cex = 1.6)),
+                    bottom = grid::textGrob("Full sibling group", gp = grid::gpar(cex = 1.6)),
+                    fig.lab = "A", fig.lab.size = 18, fig.lab.face = "bold")
+
+#png("~/Documents/crayfish_lab/jaredYseq2022/juvs/all_cohorts_newAbbrevs_landscape_7-17-2024.png", width = 13, height =13, units = "in", res=200)
+gridExtra::grid.arrange(cohort4report3_ann, leggy, nrow=2, heights=c(10, 1))
+#dev.off()
+
+
+####### FIGURE 2B #######
+## put together mean carapace length vs date by sib grp line plot
+fs.lines.pA <- ggarrange(FC12.fs.plot2$FC12.s.dateLines.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.title = element_text(size = 16)), FC17b.fs.plot2$FC17b.s.dateLines.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.title = element_blank()), MB1.fs.plot2$MB1.s.dateLines.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.title = element_blank()), SHD.fs.plot2$SHD.s.dateLines.plot + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.title = element_blank()), labels = c("B"), font.label = list(size=24))
+
+fs.lines.p <- annotate_figure(fs.lines.pA, left = ggpubr::text_grob("Mean carapace length (mm)", rot = 90, size = 20))
+
+# ggsave(fs.lines.p, filename = "~/Documents/crayfish_lab/jaredYseq2022/juvs/juvCarapOverTimeSibs_newAbbrevs_4-11-2024.png", width = 13, height =11)
+
+fs.lines.pA
+```
+
+&nbsp;
+
+# ID samples to remove for cohorts 
+```{r, message=FALSE, warning=FALSE}
+# For MB1, list of Fall2021 samples and Spring2021 samples with >20mm carapice length to remove
+MB1.Fall2021 <- fs.MB1.df.dist2 %>% filter(DateGrp == "Fall2021") %>% dplyr::select(SequenceID)
+MB1szRm <- fs.MB1.df.dist2 %>% filter(DateGrp == "Spring2021") %>% filter(Carap_mm > 20) %>% dplyr::select(SequenceID)
+
+MB12rm <- rbind(MB1.Fall2021, MB1szRm)
+
+#write.table(MB12rm, "~/Documents/crayfish_lab/jaredYseq2022/juvs/MB1samples2rm.txt", quote = FALSE,row.names = FALSE, col.names = FALSE, sep = '\t')
+
+# For SHD, list of samples with >20mm carapace length to remove, cohort 1: Fall2020+May2021, cohort 2: Summer2021+Fall2021
+SHDszRm <- fs.SHD.df.dist2 %>% filter(DateGrp == "May2021") %>% filter(Carap_mm > 20) %>% dplyr::select(SequenceID)
+SHDcohort1 <- fs.SHD.df.dist2 %>% filter(DateGrp == "Fall2020"| DateGrp == "May2021") %>% filter(!SequenceID %in% SHDszRm$SequenceID) %>% dplyr::select(SequenceID)
+SHDcohort2 <- fs.SHD.df.dist2 %>% filter(DateGrp == "Aug_Sept2021"| DateGrp == "Oct2021") %>% dplyr::select(SequenceID)
+
+#write.table(rbind(MB12rm,SHDszRm), "~/Documents/crayfish_lab/jaredYseq2022/juvs/MB1-SHDjuvs2rm.txt", quote = FALSE,row.names = FALSE, col.names = FALSE, sep = '\t')
+
+
+########## formatting data for Colony
+# Load in data
+juvs <- read_delim("~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.GT.FORMAT", delim = "\t") 
+
+juvs2 <- juvs %>% pivot_longer(cols = 3:904,  
+                             names_to = "ind", 
+                             values_to = "gt") %>%  
+  mutate(locusA = paste0(CHROM,POS)) %>% 
+  mutate(locus = paste0("L", as.numeric(as.factor(locusA)))) %>% # better way to do this?
+  dplyr::select(locus, ind, gt) 
+
+markers.juvs <- marker_create(unique(juvs2$locus), cod = 0, gte = 0.01, ote = 0.001) 
+
+
+# MB1
+MB1.dat.pop <- juvs2 %>% filter(grepl("MB1", ind))
+MB1.j.dat <- MB1.dat.pop %>% filter(grepl('J', ind))
+MB1.j.dat <- MB1.j.dat %>% filter(!ind %in% MB12rm$SequenceID)
+colonyDat.MB1.j2 <- vcf_colony(MB1.j.dat)
+
+# colonydat_create(moms = NA, dads = NA, kids=colonyDat.MB1.j2, markers=markers.juvs, update.alfs = 0,
+#                               spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+#                               clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+#                               run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+#                               likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+#                               output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.MB1_co1.dat")
+
+
+# SHD separate
+SHD.dat.pop <- juvs2 %>% filter(grepl("SHD", ind))
+SHD.j.dat <- SHD.dat.pop %>% filter(grepl('J', ind))
+SHD.co1.j.dat <- SHD.j.dat %>% filter(ind %in% SHDcohort1$SequenceID)
+SHD.co2.j.dat <- SHD.j.dat %>% filter(ind %in% SHDcohort2$SequenceID)
+colonyDat.SHD.co1.j2 <- vcf_colony(SHD.co1.j.dat)
+colonyDat.SHD.co2.j2 <- vcf_colony(SHD.co2.j.dat)
+
+# colonydat_create(moms = NA, dads = NA, kids=colonyDat.SHD.co1.j2, markers=markers.juvs, update.alfs = 0,
+#                    spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+#                    clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+#                    run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+#                    likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+#                    output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.SHD_co1.dat")
+
+# colonydat_create(moms = NA, dads = NA, kids=colonyDat.SHD.co2.j2, markers=markers.juvs, update.alfs = 0,
+#                    spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+#                    clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+#                    run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+#                    likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+#                    output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.SHD_co2.dat")
+
+
+# SHD combined - with big spring juvs removed
+SHD.combo <- rbind(SHD.co1.j.dat, SHD.co2.j.dat)
+colonyDat.SHD.com.j2 <- vcf_colony(SHD.combo)
+
+# colonydat_create(moms = NA, dads = NA, kids=colonyDat.SHD.com.j2, markers=markers.juvs, update.alfs = 0,
+#                    spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+#                    clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+#                    run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+#                    likelihood.precision = 2, prob.mom = 0, prob.dad = 0,
+#                    output_file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/colony2.j.SHD_com.dat")
+
+
+```
+
+&nbsp;
+
+# Juvenile cohorts
+```{r, message=FALSE, warning=FALSE}
+pop4tab <- c("FC12", "FC17b", "MB1", "SHD")
+noCohorts <- c(1, 1, 1, 2)
+Ns <- c("all", "all", "Fall2020+Spring2021", "1:Fall2020+May2021 2:Summer2021+Fall2021")
+Nb <- c("all", "all", "Fall2020+Spring2021", "1:Fall2020+May2021 2:Summer2021+Fall2021")
+extraRuns <- c(NA, NA, "A:rm Fall2021(N=5) B:20mm cutoff for Spring2021", "A:all B:2 cohorts C:20mm cutoff for Spring2021")
+
+cohort.tab <- cbind(pop4tab, noCohorts, Ns, Nb, extraRuns)
+
+kable(cohort.tab, caption = "Juvenile cohorts") %>% kable_styling()
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Calculate Ns (reconstructed parental genotypes based on the pedigrees)
+Use Ellie Wiese's Ns_calc. R script [Ns_calc.R](https://github.com/weiseell/NbdLamprey/tree/master/Homebrew) to calculate Ns from BestConfig file from Colony. 
+```{r, message=FALSE, warning=FALSE}
+#Ns_calc - function
+#function takes a Colony2 BestConfig file and does an extrapolated Ns curve
+
+#Inputs:
+#family - best config file (has four columns: OffspringID, FatherID, MotherID, and ClusterIndex)
+
+#Outputs:
+#list with three elements
+#1. Curve for the extrapolated Ns model
+#2. The asymptote value for all methods
+#3. Ns value (not extrapolated)
+
+Ns_calc <- function(family){
+  require(vegan)
+  family$FatherID <- paste0("Dad",family$FatherID)
+  family$MotherID <- paste0("Mom",family$MotherID)
+  #making matrix for dads
+  dads <- data.frame(matrix(0,nrow = length(family$OffspringID),ncol = length(unique(family$FatherID))))
+  colnames(dads) <- unique(family$FatherID)
+  rownames(dads) <- family$OffspringID
+  #making matrix for moms
+  moms <- data.frame(matrix(0,nrow = length(family$OffspringID),ncol = length(unique(family$MotherID))))
+  colnames(moms) <- unique(family$MotherID)
+  rownames(moms) <- family$OffspringID
+  
+  #loop to fill in matrix with parents
+  for (i in 1:length(family$OffspringID)) {
+    off <- family[i,]
+    dadn <- which(off$FatherID == colnames(dads))
+    dads[i,dadn] <- 1
+  }
+  for (i in 1:length(family$OffspringID)) {
+    off <- family[i,]
+    momn <- which(off$MotherID == colnames(moms))
+    moms[i,momn] <- 1
+  }
+  parents <- cbind(moms,dads)
+  Ns <- as.matrix(ncol(parents))
+  colnames(Ns) <- "Ns"
+  ns_points <- specaccum(parents,method = "random")
+  asymp <- specpool(parents)
+  output <- list(ns_points,asymp,Ns)
+  output
+}
+
+
+# process one pop
+#bc <- fread("~/Documents/crayfish_lab/analysesOf2020data/Ns/FC12_2020_juvs.BestConfig")
+# out <- Ns_calc(bc)
+# plot(out[[1]])
+# out[[2]]
+# out[[3]]
+
+
+# load in bestConfig files of JUVENILES and calc Ns
+bc.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns", pattern='*.BestConfig', full.names = TRUE)
+
+bc.files <- bc.files[c(1:4, 6:8)]
+
+bc.j.list <- list()
+for (FILE in bc.files){
+  bc.df <- as.data.frame(fread(FILE))
+  pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(13)]
+  outName <- paste( pop, 'out', sep = '.' )
+  dfName <- paste( pop, 'df', sep = '.' )
+  cfName <- paste( pop, 'cf', sep = '.' )
+  pltName <- paste( pop, 'plot', sep = '.' )
+  bc.j.list[[outName]] <- Ns_calc(bc.df)
+  out <- Ns_calc(bc.df)
+  out.df <- with(out[[1]], data.frame(sites, richness, sd))
+  
+  if (pop == "FC12") { renam <- "EastGC2" }
+  if (pop == "FC16") { renam <- "EastGC1" }
+  if (pop == "FC17b") { renam <- "EastGC4" }
+  if (pop == "MB1") { renam <- "WestGC1" }
+  if (pop == "MB1co1") { renam <- "WestGC1_co1" }
+  if (pop == "SHD") { renam <- "Hotel1" }
+  if (pop == "FC12yFC17b") { renam <- "EastGC_com" }
+  if (pop == "SHDco1") { renam <- "Hotel1_co1" }
+  if (pop == "SHDco2") { renam <- "Hotel1_co2" }
+  if (pop == "SHDcom") { renam <- "Hotel1_com" }
+  
+  out.df$pop <- renam
+  bc.j.list[[dfName]] <- out.df
+  
+  # report chao from specpool
+  chao.df <- with(out[[2]], data.frame(Species, chao, chao.se))
+  chao.df$pop <- renam
+  bc.j.list[[cfName]] <- chao.df
+  
+  # plotting tips see https://rpubs.com/Roeland-KINDT/694021
+  bc.j.list[[pltName]] <- ggplot(out.df, aes(x=sites, y=richness)) +
+            geom_line() + geom_point() +
+            geom_errorbar(aes(ymin=richness-sd, ymax=richness+sd), width=.2,
+                 position=position_dodge(0.05)) +
+            labs(title = renam) +
+            theme_minimal()
+  
+}
+
+```
+
+&nbsp;
+
+### Plot Ns curves
+**Figure 4**
+```{r, message=FALSE, warning=FALSE}
+# Combine data into one and plot one plot
+out.df.all <- rbind(bc.j.list$FC12.df, bc.j.list$FC17b.df, bc.j.list$FC12yFC17b.df, bc.j.list$MB1co1.df, bc.j.list$SHDco1.df, bc.j.list$SHDco2.df, bc.j.list$SHDcom.df)
+
+Ns.p2 <- ggplot(out.df.all, aes(x=sites, y=richness, color=pop)) +
+    geom_line() + geom_point() +
+    geom_errorbar(aes(ymin=richness-sd, ymax=richness+sd), width=.2, position=position_dodge(0.05)) +
+    scale_color_viridis_d() +
+    theme_minimal()
+
+# Combine chao estimates to add to plot
+chao.df.all <- rbind(bc.j.list$FC12.cf, bc.j.list$FC17b.cf, bc.j.list$FC12yFC17b.cf, bc.j.list$MB1co1.cf, bc.j.list$SHDco1.cf, bc.j.list$SHDco2.cf, bc.j.list$SHDcom.cf)
+
+# Plot with ribbons
+out.df.all$UPR <- out.df.all$richness + out.df.all$sd
+out.df.all$LWR <- out.df.all$richness - out.df.all$sd
+
+# Change MB1co1 to just MB1
+out.df.all$pop <- gsub("WestGC1_co1", "WestGC1", out.df.all$pop)
+chao.df.all$pop <- gsub("WestGC1_co1", "WestGC1", chao.df.all$pop)
+
+
+# Plot - keep SHD combined, FC separate && RENAME plots
+out.df.all$pop <- factor(out.df.all$pop, levels = c("EastGC2", "EastGC4", "EastGC_com", "WestGC1", "Hotel1_co1", "Hotel1_co2", "Hotel1_com"))
+
+Ns.p7 <- ggplot(out.df.all %>% filter(!pop == "EastGC_com"), aes(x=sites, y=richness, color=pop, ymax = UPR, ymin = LWR)) +
+    geom_line(show.legend = FALSE) + #geom_point(show.legend = FALSE) +
+    #geom_errorbar(aes(ymin=richness-sd, ymax=richness+sd), width=.2, position=position_dodge(0.05)) +
+    geom_ribbon(aes(colour=pop, fill=after_scale(alpha(color, 0.3))), show.legend=FALSE) + 
+    #scale_color_viridis_d() +
+    geom_hline(data=chao.df.all %>% filter(!pop == "EastGC_com"), aes(yintercept = chao, color=factor(pop)), linetype=4, show.legend = F) +
+  geom_text(data=chao.df.all %>% filter(!pop == "EastGC_com"), aes(y=chao + 5, x=285, label = pop, color=pop), show.legend = F, inherit.aes = FALSE, size=6) +
+    theme_minimal() + xlab("Sites") + ylab("Richness") + 
+    labs(color = "Population") + theme(text = element_text(size = 20)) +
+  scale_color_viridis_d(end=0.95)
+
+#ggsave(Ns.p7, filename = "~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns/Ns_plotwChao_newAbbrevs_4-14-2024.png", width = 11, height =8)
+
+Ns.p7
+```
+
+&nbsp;
+
+## Look for overlap in parents between cohorts in Hotel1
+```{r, message=FALSE, warning=FALSE}
+SHD.com.df <- as.data.frame(fread(bc.files[7]))
+SHD.com.df <- SHD.com.df %>% mutate(SequenceID=OffspringID)
+
+SHD.com.met <- left_join(SHD.com.df, SHD.fs.plot2$SHDfs.df.dist) %>% dplyr::select(SequenceID, FatherID, MotherID, ClusterIndex, DateGrp)
+
+# reminder: SHD_co1 = Fall2020-Spring2021; SHD_co2 = Summer2021-Fall2021
+
+mom.shd <- SHD.com.met %>% group_by(MotherID, DateGrp) %>% tally()
+# juvs assigned from 2 diff cohorts for 6 "moms"
+# mom #13 had most juvs in Fall2021 and 1 juv in Spring2021 - males *12, *15x2, *21, *27 (Spring2021) 
+# mom #19 had 1 juv in Fall 2020 and 1 juv in Fall2021 - males *18, *34
+# mom #24 had 2 juvs in Fall2020 and 1 juv in Fall2021 - males *25, *28, *40
+# mom #28 had 1 juv in Spring2021 and 1 juv in Fall2021 - males *31, *35
+# mom #31 had 6 juvs in Fall2020 and 5 juvs in Fall2021 - males *24 (Fall2020), *35 (Fall2021)
+# mom #8 had 1 juv in Spring2021 and 1 juv in Fall2021 - males *9, *21
+
+dad.shd <- SHD.com.met %>% group_by(FatherID, DateGrp) %>% tally()
+## Repeat for inferred "dads"
+# dad *17 had 1 juv in Fall2020 and 4 juvs in Fall2021 - moms #32 (Fall2020), #18 (Fall2021)
+# dad *18 had 2 juvs in Fall2020/Spring2021 and 1 juv in Fall2021 - moms #25, #27 (Fall2020/spring 2021), #19 (Fall2021)
+# dad *21 had 1 juv in Spring2021 and 1 juv in Fall2021 - moms #8 (Spring2021), #13 (Fall2021)
+# dad *25 had 7 juvs in Fall2020 and 1 juv in Fall2021 - moms #22, #24 (Fall2020), #35 (Fall2021)
+
+
+# Look at probability for these
+best.clus <- as.data.frame(fread("~/Documents/crayfish_lab/jaredYseq2022/juvs/Output.data.BestCluster_SHD_com"))
+best.clus$SequenceID <- best.clus$OffspringID
+moms2keep <- c("8", "#13", "#19", "#24", "#28", "#31")
+dads2keep <- c("*17", "*18", "*21", "*25")
+SHD.com.met.share <- SHD.com.met %>% filter(MotherID %in% moms2keep|FatherID %in% dads2keep)
+
+best.clus.meta <- left_join(best.clus, SHD.com.met)
+
+SHD.com.probs <- left_join(SHD.com.met.share, best.clus, by=c("SequenceID", "MotherID", "FatherID", "ClusterIndex"))
+
+SHD.com.moms <- SHD.com.probs %>% arrange(MotherID) %>% group_by(MotherID) %>% summarise(mean(Probability)) 
+# mom #8 mean prob = 0.850
+# mom #13 mean prob = 0.85
+# mom #19 mean prob = 0.3594
+# mom #24 mean prob = 0.145
+# mom #28 mean prob = 0.260
+# mom #31 mean prob = 0.260
+
+SHD.com.dads <-SHD.com.probs %>% arrange(FatherID) %>% group_by(FatherID) %>% summarise(mean(Probability)) 
+# dad *17 mean prob = 0.273
+# dad *18 mean prob = 0.359
+# dad *21 mean prob = 0.850
+# dad *25 mean prob = 0.145
+
+# the average prob over all juvs
+meanProb <- best.clus %>% summarise(mean(Probability)) # 0.736
+medProb <- best.clus %>% summarise(median(Probability)) # 0.8499
+avg.mom <- best.clus %>% group_by(MotherID) %>% summarise(mean(Probability)) # range = 0.1447 - 1.0
+avg.dad <- best.clus %>% group_by(FatherID) %>% summarise(mean(Probability)) # range = 0.1447 - 1.0
+
+# Take the offspring with 0.6 or 0.8 probability assigned to mom or dad and look at Full Sib probabilities? use FullSibDyad file
+
+best.sibs <- as.data.frame(fread("~/Documents/crayfish_lab/jaredYseq2022/juvs/Output.data.FullSibDyad_SHD_com"))
+# mom #13
+kids.mom13 <- SHD.com.met %>% filter(MotherID == "#13") %>% dplyr::select(SequenceID)
+mom13 <- best.sibs %>% filter(OffspringID1 %in% kids.mom13| OffspringID2 %in% kids.mom13 )
+
+# see SHDco1SHDco2_siblings.xlsx
+
+```
+
+&nbsp;
+
+## Look for shared parents between EastGC2 and EastGC4
+```{r, message=FALSE, warning=FALSE}
+FC.com.df <- as.data.frame(fread(bc.files[2]))
+FC.com.df <- FC.com.df %>% mutate(SequenceID=OffspringID)
+
+FC.com.met <- left_join(FC.com.df, FCcom.fs.plot2) %>% dplyr::select(SequenceID, FatherID, MotherID, ClusterIndex, DateGrp, Site_Abbrev)
+
+# reminder: FC_co1 = Fall2020-Spring2021; FC_co2 = Summer2021-Fall2021
+
+FC.mom <- FC.com.met %>% group_by(MotherID, Site_Abbrev) %>% tally() %>% filter(n()>1)
+sameMomdiffPondFC <- length(unique(FC.mom$MotherID))
+# juvs assigned to same mom from different ponds for 19 "moms"
+
+
+FC.dad <- FC.com.met %>% group_by(FatherID, Site_Abbrev) %>% tally() %>% filter(n()>1)
+sameDadDiffPond <- length(unique(FC.dad$FatherID))
+# juvs assigned to same dad from different ponds for 21 "dads"
+
+
+# Look at probability for these
+best.clus2 <- as.data.frame(fread("~/Documents/crayfish_lab/jaredYseq2022/juvs/Output.data.BestCluster_FC12yFC17b"))
+best.clus2$SequenceID <- best.clus2$OffspringID
+moms2keep2 <- unique(FC.mom$MotherID)
+dads2keep2 <- unique(FC.dad$FatherID)
+FC.com.met.share <- FC.com.met %>% filter(MotherID %in% moms2keep2|FatherID %in% dads2keep2)
+
+FC.com.probs <- left_join(FC.com.met.share, best.clus2, by=c("SequenceID", "MotherID", "FatherID", "ClusterIndex"))
+
+#FC.mom.probs <- FC.com.probs %>% group_by(MotherID) %>% summarise(mean(Probability)) %>% arrange(`mean(Probability)`)
+#hist(FC.mom.probs$`mean(Probability)`)
+FC.mom.probs <- FC.com.probs %>% filter(MotherID %in% moms2keep2)
+hist(FC.mom.probs$Probability)
+FC.mom.probs80 <- FC.mom.probs %>% filter(Probability >= 0.8) #35 juveniles with 80*% prob assigned to "moms" with juvs in two ponds 
+juvsofFC.mom.probs80 <- FC.mom.probs80 %>% arrange(MotherID)
+
+# FC.dad.probs <- FC.com.probs %>% group_by(FatherID) %>% summarise(mean(Probability)) %>% arrange(`mean(Probability)`)
+# hist(FC.dad.probs$`mean(Probability)`) 
+# FC.dad.probs80 <- FC.dad.probs %>% filter(`mean(Probability)` > 0.8) 
+FC.dad.probs <- FC.com.probs %>% filter(FatherID %in% dads2keep2)
+hist(FC.dad.probs$Probability)
+FC.dad.probs80 <- FC.dad.probs %>% filter(Probability >= 0.8) #39 juveniles with 80*% prob assigned to "moms" with juvs in two ponds 
+juvsofFC.dad.probs80 <- FC.dad.probs80 %>% arrange(FatherID)
+
+
+# the average prob over all juvs
+juvsmeanProb <- best.clus2 %>% summarise(mean(Probability)) # 0.795
+juvsmedProb <- best.clus2 %>% summarise(median(Probability)) # 0.948
+avg.mom2 <- best.clus2 %>% group_by(MotherID) %>% summarise(mean(Probability)) # range = 0.058 - 1.0
+avg.dad2 <- best.clus2 %>% group_by(FatherID) %>% summarise(mean(Probability)) # range = 0.058 - 1.0
+
+
+# Take the offspring with 0.6 or 0.8 probability assigned to mom or dad and look at Full Sib probabilities? use FullSibDyad file
+best.sibs2 <- as.data.frame(fread("~/Documents/crayfish_lab/jaredYseq2022/juvs/Output.data.FullSibDyad_FC12yFC17b"))
+
+best.sibs2.momA <- best.sibs2 %>% filter(OffspringID1 %in% FC.mom.probs80$SequenceID)
+best.sibs2.momB <- best.sibs2 %>% filter(OffspringID2 %in% FC.mom.probs80$SequenceID)
+best.sibs2.mom <- rbind(best.sibs2.momA, best.sibs2.momB)
+bestsibs.mom.h <- hist(best.sibs2.mom$Probability)
+best.sibs2.mom.80 <- best.sibs2.mom %>% filter(Probability >= 0.8) #N=28 pairs
+
+best.sibs2.dadA <- best.sibs2 %>% filter(OffspringID1 %in% FC.dad.probs80$SequenceID)
+best.sibs2.dadB <- best.sibs2 %>% filter(OffspringID2 %in% FC.dad.probs80$SequenceID)
+best.sibs2.dad <- rbind(best.sibs2.dadA, best.sibs2.dadB)
+bestsibs.mom.h <- hist(best.sibs2.dad$Probability)
+best.sibs2.dad.80 <- best.sibs2.dad %>% filter(Probability >= 0.8) #N=14 pairs
+
+# see excel file for full vs half sib breakdown of these sibs- FC12yFC14_siblings.xlsx
+
+# Get size of full sib pairs
+fs.pairs <- juvs4colony %>% filter(SequenceID %in% c("FC17b-J172-22", "FC12-J22", "FC12-J46"))
+
+# Check size of all sib pairs across FC12 v FC17b
+sibtab <- as.data.frame(read_excel("~/Documents/crayfish_lab/jaredYseq2022/juvs/Adams_TableS5_FC12-FC17b_sibship.xlsx", skip = 2)) # N=130
+sibtab2 <- sibtab %>% distinct(`Juvenile ID`, .keep_all=TRUE)  # remove duplicate juvs N=112
+
+FCsibsFallvSpring.p <- ggplot(sibtab2 %>% filter(!`Time collected` =="Summer 2020"),
+                              aes(x=`Time collected`, y=`Carapace length (mm)`)) +
+  geom_boxplot() +
+  ggpubr::stat_compare_means() +
+  theme_minimal()
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Estimate reproductive success (number of offspring) mean (k-bar) 
+Using the Colony BestConfig files estimate mean K-bar using rarefaction to lowest juvenile sample size. Subsample the Colony output for each cohort to 75 random offspring (the smallest sample size is 90) repeatedly, then calculate RS from the subsample and average across the replicates. For a significance estimate, calculate the confidence intervals and see if they overlap.
+```{r, warning=FALSE, message=FALSE}
+# written by John Robinson, modified by NEA
+
+bc.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns", pattern='*.BestConfig', full.names = TRUE)
+
+#The number of random subsamples to take
+nreps <- 1000
+#The sample size to subsample to
+subsamp.n <- 75 # lowest N=90, but to get CI need lower
+
+rareDF <- data.frame(pop = NA, RS = NA, RSsd = NA)
+for (FILE in bc.files){
+  bc.df <- as.data.frame(fread(FILE))
+  rareDF$pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(13)]
+  tmpRS <- c()
+  for(rep in 1:nreps) {
+  	tmp.df <- bc.df[sample(c(1:length(bc.df$OffspringID)), subsamp.n, replace = FALSE),]
+  	tmp.tab <- table(c(tmp.df$MotherID, tmp.df$FatherID))
+  	tmpRS[rep] <- mean(tmp.tab)
+  	rm(tmp.df, tmp.tab)
+  }
+  rareDF$RS <- mean(tmpRS)
+  rareDF$RSsd <- sd(tmpRS)
+  conf.level <- 0.95
+  alpha <- 1 - conf.level
+  ci <- quantile(tmpRS, probs = c(alpha/2, 1-alpha/2 ))
+  rareDF$CI.l <- ci[1]
+  rareDF$CI.u <- ci[2]
+  rm(tmpRS, bc.df)
+  
+  # Append the result to the file
+  #write.table(rareDF, file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns/rarefied75_RS_wCI.csv", append = TRUE, row.names = FALSE, col.names=FALSE, quote = FALSE, sep = ",")
+}
+
+rare.out <-  read.csv("~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns/rarefied75_RS_wCI.csv", header=FALSE)
+colnames(rare.out) <- c("cohort", "mean_rarefied_RS", "sd", "95_CI_lower", "95_CI_upper")
+
+rare.out
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Calculate coancestry
+Based on [Scribner et al., 2022](https://doi.org/10.1016/j.jglr.2021.12.005)
+code from [Scribner github](https://rdrr.io/github/ScribnerLab/SeaLampreyRapture/src/R/coancestry.R)
+```{r, warning=FALSE, message=FALSE}
+source("~/Documents/crayfish_lab/jaredYseq2022/juvs/coancestry.R")
+
+# load in bestConfig file of JUVENILES and calc Ns
+bc.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns", pattern='*.BestConfig', full.names = TRUE)
+
+#bc.files <- bc.files[c(1:3, 5:7)]
+
+bc.coa.list <- list()
+for (FILE in bc.files){
+  bc.df <- as.data.frame(fread(FILE))
+  pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(13)]
+  allName <- paste( pop)
+  
+  bc.coa.list[[allName]] <- coancestry(bc.df)
+}
+
+coa.df <- as.data.frame(unlist(bc.coa.list))
+coa.df$`unlist(bc.coa.list)` <- round(coa.df$`unlist(bc.coa.list)`, 3)
+
+coa.df
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Plot pedigree 
+**Figure 3**
+Using Ellie Weise's code to make a pedigree like Fig 5 in Weise et al. 2022
+```{r, warning=FALSE, message=FALSE}
+
+source("~/Documents/crayfish_lab/pedigree.plot_ellieWeise.R")
+
+bc.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs/Ns", pattern='*.BestConfig', full.names = TRUE)
+
+#bc.files <- bc.files[c(1:3, 5:7)]
+
+bc.ped.list <- list()
+for (FILE in bc.files){
+  bc.df <- as.data.frame(fread(FILE))
+  
+  if (grepl("MB1", FILE)) {
+    pop <- "MB1" # even tho using MB1co1, don't have MB1co2 so just using MB1 as label
+  } else {
+    pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(13)]
+    }
+  
+  dfName <- paste( pop, 'df', sep = '.' )
+  tabName <- paste( pop, 'tab', sep = '.' )
+  fName <- paste0("~/Documents/crayfish_lab/jaredYseq2022/juvs/", pop, ".ped.jpeg")
+  
+  bc.ped.list[[dfName]] <- bc.df
+  bc.df2 <- bc.df %>% mutate(MOM=OffspringID) %>% separate(MOM, into = c("mom1", "mom2", "J", "year"))  %>% mutate(knownMom=ifelse(is.na(year)==TRUE, paste0(mom1,"-", mom2), paste0(mom1, "-",mom2,"-", year))) %>% dplyr::select(OffspringID, FatherID, MotherID, ClusterIndex, knownMom)
+  bc.ped.list[[tabName]] <- bc.df2 %>% group_by(MotherID,FatherID) %>% count() 
+  
+  #jpeg(file = fName, height = 5, width = 3, units = "in", res = 200)
+  pedigree.plot(bc.df, title=pop, cohortbox=F)
+  #dev.off()
+}
+
+
+pedigree.plot(bc.ped.list$FC12.df, title="EastGC2", cohortbox=F)
+pedigree.plot(bc.ped.list$FC17b.df, title="EastGC4", cohortbox=F)
+pedigree.plot(bc.ped.list$MB1.df, title="WestGC1", cohortbox=F)
+pedigree.plot(bc.ped.list$SHDco1.df, title="Hotel1_co1", cohortbox=F)
+pedigree.plot(bc.ped.list$SHDco2.df, title="Hotel1_co2", cohortbox=F)
+
+# do SHD cohorts combined
+# add cohort column to df
+bc.ped.list$SHDcom.df$cohort <- ifelse(bc.ped.list$SHDcom.df$OffspringID %in% bc.ped.list$SHDco1.df$OffspringID, "cohort 1", "cohort 2")
+
+pedigree.plot(bc.ped.list$SHDcom.df, title="Hotel1_com", cohortbox=T) #save manually
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Calculate Nb (effective number of breeders)
+### Remove samples from juvenile VCF
+Remove Fall2021 MB1 samples and Spring2021 samples with >20mm carapace length from MB1 and SHD. To estimate Nb, do not want to use the VCF that was filtered for "best SNP" per RAD tag
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0  
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20.vcf --remove MB1-SHDjuvs2rm.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_4Nb.vcf  
+
+```
+
+&nbsp;
+
+### Make a file of individual and pop/cohort assignment for PGDSpider to put into NeEstimator
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+FC124Nb <- fs.FC12.df.dist2 %>% mutate(cohort="FC12") %>% dplyr::select(SequenceID, Site_Abbrev, cohort)
+FC17b4Nb <- fs.FC17b.df.dist2 %>% mutate(cohort="FC17b") %>% dplyr::select(SequenceID, Site_Abbrev, cohort)
+MB14Nb <- fs.MB1.df.dist2 %>% filter(!SequenceID %in% MB12rm$SequenceID) %>% mutate(cohort="MB1_co1") %>% dplyr::select(SequenceID, Site_Abbrev, cohort)
+SHDco14Nb <- fs.SHD.df.dist2 %>% filter(DateGrp == "Fall2020"| DateGrp == "May2021") %>% filter(!SequenceID %in% SHDszRm$SequenceID) %>% mutate(cohort="SHD_co1") %>% dplyr::select(SequenceID, Site_Abbrev, cohort)
+SHDco24Nb <- fs.SHD.df.dist2 %>% filter(DateGrp == "Aug_Sept2021"| DateGrp == "Oct2021") %>% mutate(cohort="SHD_co2") %>% dplyr::select(SequenceID, Site_Abbrev, cohort)
+
+all4Nb <- rbind(FC124Nb, FC17b4Nb, MB14Nb, SHDco14Nb, SHDco24Nb) %>% dplyr::select(-Site_Abbrev)
+
+#vcfIDs <- read.delim("~/Documents/crayfish_lab/jaredYseq2022/juvs/Nb/ids4Nb.txt", header = F) # double check same seqIds..
+
+# write.table(all4Nb, file="~/Documents/crayfish_lab/jaredYseq2022/juvs/Nb/juvs.pop_cohort_def.txt", sep = " ", row.names=FALSE, col.names=FALSE, quote=FALSE, append = FALSE)
+
+# with SHD combo
+all4Nb2 <- all4Nb
+all4Nb2$cohort <- gsub("SHD_co2", "SHD_com", all4Nb2$cohort)
+all4Nb2$cohort <- gsub("SHD_co1", "SHD_com", all4Nb2$cohort)
+
+# write.table(all4Nb2, file="~/Documents/crayfish_lab/jaredYseq2022/juvs/Nb/juvs.pop_cohort2_def.txt", sep = " ", row.names=FALSE, col.names=FALSE, quote=FALSE, append = FALSE)
+
+```
+
+&nbsp;
+
+Use the PGDSpider GUI (on PC) to convert VCF to Genepop format along with a pop text file just made. Following these steps:
+1. Choose VCF and load file
+2. Choose Genepop as output format
+3. Give output file a name via 'select output file'
+4. Click create/edit SPID file
+5. Scroll to bottom and check add pop definition file and upload file
+6. Save to directory and apply
+7. Convert 
+
+&nbsp;
+
+### Make a file of chromosomes to run with NeEstimator
+Make a chromosome map file so NeEstimator doesn't calculate SNPs on the same chromosome
+```{bash, eval=FALSE}
+zcat GCF_020424385.1_ASM2042438v2_genomic.fna.gz |grep ">" | head
+zcat GCF_020424385.1_ASM2042438v2_genomic.fna.gz |grep ">" | head
+
+zcat GCF_020424385.1_ASM2042438v2_genomic.fna.gz | grep "NC_" > chrMapA.txt
+
+cat chrMapA.txt | cut -f1,8 -d ' ' > chrMapB.txt
+
+cat chrMapB.txt | sed 's/>//g' | sed 's/,//g' | sed 's/ /\t/g' > chrMap.txt
+
+#scp adamsn23@gateway.hpcc.msu.edu:"/mnt/home/adamsn23/RedSwampCrayfish/reference/chrMap.txt
+
+# Need it of each SNP
+grep -v "^##" filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_4Nb.vcf | cut -f1,3 > snpMap.txt
+
+```
+
+&nbsp;
+
+## Running NeEstimator
+Used the Genepop output file from PGDSpider to put into NeEstimator GUI. Run LD with random mating method. I kept the default critical values (0.05, 0.02, 0.01). And check the box for exclude singletons.
+
+&nbsp;
+
+NeEstimator GUI (on PC). Copied Genepop file into NeEstimator program directory. Choose Genepop file under 'choose file'. Check Genepop file format. Check LD - model: Random Mating. Uncheck rest of models in that section. Keep default critical values (0.05, 0.02, 0.01). Check the box for exclude singletons. Uncheck box for frequency restriction. Nothing checked in 'Options' section. No additional output files selected. Click 'create parameter file' then 'Run Ne'
+
+&nbsp;
+
+### Putting Nb results in R
+Input the NeEstimator Nb output manually into R.
+JaredYseq_genepop_wSHDcom_1-28-2023.txt and JaredYseq_genepop_wSHDco1y2_1-28-2023.txt (use these)
+```{r, message=FALSE, warning=FALSE}
+# Loci 2262
+
+popsxx <- c("FC12", "FC17b", "MB1_co1", "SHD_co1", "SHD_co2", "SHD_com")
+sampSz <- c(118, 294, 218, 90, 147, 237)
+
+# combine Nb and jackknife CI into one line
+Nb <- c("99.0 (71.9 - 150.7)", "112.4 (97.1 - 129.8)" ,"54.2 (39.6 - 79.6)", "21.7 (16.9 - 28.5)", "15.0 (13.2 - 17.0)", "26.4 (23.5 - 29.5)")
+
+# add NB_wang estimate from Colony output
+Nb_Wang <- c("145 (114 - 191)", "253 (211 - 302)", "121 (96 - 157)", "33 (21 - 55)", "24 (14 - 43)", "49 (34 - 73)")
+
+cohort <- c("Fall2020-Spring2021", "Fall2020-Spring2021", "Fall2020-Spring2021", "Fall2020-Spring2021", "Summer2021-Fall2021", "Fall2020-Fall2021")
+
+nb.df <- rbind(cohort, sampSz, Nb, Nb_Wang)
+colnames(nb.df) <- popsxx
+
+nb.df %>% kbl() %>% kable_styling()
+
+```
+
+&nbsp;
+
+#### Assess relationship between CPUE and Nb and Ns
+```{r, warning=FALSE, message=FALSE}
+# load CPUE data
+cpue <- read.csv("~/Documents/crayfish_lab/RSC_projectData/MonthlyCPUE_GeeMinnows_wAbbrevs.csv")
+
+cpue2 <- cpue %>% filter(site_abbrev %in% c("FC12", "FC17b", "MB1", "SHD"))
+
+popsxx <- c("FC12", "FC17b", "MB1_co1", "SHD_co1", "SHD_co2", "SHD_com")
+sampSz <- c(118, 294, 218, 90, 147, 237)
+estNb_ld <- c(172.2, 197.3, 66.7, 27.0, 17.6, 33.7) # used the No S* (singletons) col
+CI_jk <- c("105.3 - 390.7", "1554.7 - 261.8" ,"44.8 - 105.3", "20.1 - 37.3", "15.3 - 20.3", "29.3 - 38.8") 
+
+# add effective pop size estimated from Colony runs
+estNb_wang <- c(145, 253, 121, 33, 24, 49) # random mating estimates
+CI_wang <- c("114 - 191", "211 - 302", "96 - 157", "21 - 55", "14 - 43", "34 - 73") # random mating estimates
+
+nb.df <- rbind(sampSz, estNb_ld, CI_jk, estNb_wang, CI_wang)
+colnames(nb.df) <- popsxx
+
+nb.df2 <- as.data.frame(t(nb.df))
+cols.num <- c("sampSz","estNb_ld", "estNb_wang")
+nb.df2[cols.num] <- sapply(nb.df2[cols.num],as.numeric)
+
+nb.df2$pop <- rownames(nb.df2)
+
+# rm SHD_com (bc have SHD-co1 and co2)
+nb.df2 <- nb.df2 %>% filter(!pop == "SHD_com")
+
+# add mean CPUE
+# "spawning time" of each cohort (e.g. FC12 was collected Fall2020-Spring2021 so I took the mean CPUE from year July 2020)
+Aug.2020.cpue <- cpue2  %>% filter(Year==2020 & Month == 8) %>% dplyr::select(monthly_CPUE)
+Aug.2021.cpue <- cpue2  %>% filter(Year==2021 & Month == 8 & label == "Sheraton") %>% dplyr::select(monthly_CPUE)
+Aug.cpue.df <- rbind(Aug.2020.cpue, Aug.2021.cpue)
+nb.df2$CPUE <- Aug.cpue.df$monthly_CPUE
+
+chao.df.all$pop <- gsub(pattern = "EastGC2",replacement = "FC12", x = chao.df.all$pop)
+chao.df.all$pop <- gsub(pattern = "EastGC4",replacement = "FC17b", x = chao.df.all$pop)
+chao.df.all$pop <- gsub(pattern = "WestGC1",replacement = "MB1_co1", x = chao.df.all$pop)
+chao.df.all$pop <- gsub(pattern = "Hotel1_co1",replacement = "SHD_co1", x = chao.df.all$pop)
+chao.df.all$pop <- gsub(pattern = "Hotel1_co2",replacement = "SHD_co2", x = chao.df.all$pop)
+#chao.df.all$pop <- gsub(pattern = "SHDcom",replacement = "SHD_com", x = chao.df.all$pop)
+
+nb.ns <- left_join(nb.df2, chao.df.all, by="pop")
+
+
+# Spearman correlation bt Nb and CPUE
+# Shapiro-Wilk normality test for Nb_ld
+st1 <- shapiro.test(nb.ns$estNb_ld) # => p = 0.219 
+# Shapiro-Wilk normality test for Nb_wang
+st2 <- shapiro.test(nb.ns$estNb_wang) # => p = 0.5188
+# Shapiro-Wilk normality test for meanCPUE
+st3 <- shapiro.test(nb.ns$CPUE) # => p = 0.9198 
+
+cor1 <-cor.test(nb.ns$estNb_ld, nb.ns$CPUE,  method = "spearman") #rho=0.2 P=0.7833; no association
+cor2 <-cor.test(nb.ns$estNb_wang, nb.ns$CPUE,  method = "spearman") #rho=0.2 P=0.7833; no association
+cor3 <-cor.test(nb.ns$chao, nb.ns$CPUE,  method = "spearman") #rho=0.4 P=0.75; no association
+
+norm <- c(st1$p.value, st2$p.value, st3$p.value)
+rho <- c(cor1$estimate, cor2$estimate, cor3$estimate)
+cor.p <- c(cor1$p.value, cor2$p.value, cor3$p.value)
+
+cor.tab <- as.data.frame(rbind(spearman_rho=round(rho,3), spearman_p=round(cor.p, 3)))
+colnames(cor.tab) <- c("Nb_ld", "Nb_wang", "chao")
+
+cor.tab %>% kbl() %>% kable_styling()
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Calculate relatedness among juveniles
+Using the method of Manichaikul et al., BIOINFORMATICS 2010 (doi:10.1093/bioinformatics/btq559) implemented in vcftools --relatedness2
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0  
+
+# Need to subset VCF for only the comparisons we can actually make (FC12 v FC17b, SHDco1 v SHDco2) bc Rxy can be biased when calc'd across pop structure/ high Fst (Wang 2011) - Nick Sard
+cd /mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/OUT/genotyped/juvs
+cat ids4Nb.txt | grep -E "FC12|FC17b" > ids4Nb_FC12yFC17b.txt #N=412
+cat ids4Nb.txt | grep -E "SHD" > ids4Nb_SHD.txt #N=237
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_4Nb.vcf --keep ids4Nb_FC12yFC17b.txt --relatedness2 --out filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_4Nb_FC12yFC17b.r
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_4Nb.vcf --keep ids4Nb_SHD.txt --relatedness2 --out filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_4Nb_SHD.r
+```
+
+&nbsp;
+
+## Look at relatedness in R
+Plot relatedness distributions and do a randomization approach to look for statistical differences between FC12 v FC17b, SHDco1 v SHDco2 based on Nick Sard's approach
+```{r, warning=FALSE, message=FALSE}
+# define for later
+phi <- c(0.5, 0.25, 0.125,  0.0625, 0)
+relationship <- c("twin", "parent-offspring/full sib", "half sib", "3rd degree", "unrelated")
+names(phi) <- relationship 
+
+
+rxy.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/juvs", pattern='*.r.relatedness2', full.names = TRUE)
+rxy.files <- rxy.files[1:2]
+
+rxy.list <- list()
+for (FILE in rxy.files) {
+  popnam <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(19)]
+  pltnam <- paste( popnam, 'plot', sep = '.' )
+  pltnam2 <- paste( popnam, 'plot2', sep = '.' )
+  outnam <- paste(popnam, "outSum", sep = '.')
+  repplt <- paste( popnam, 'rep.p', sep = '.' )
+  rel.df <- read.delim(FILE)
+  
+  if(grepl("FC", FILE)) {
+    renam <- "EastGC2_EastGC4"
+    keep <- c("FC12-FC12", "FC17b-FC17b")
+    plot.labels <- c("FC12-FC17b"="EastGC2-EastGC4",
+                     "FC17b-FC17b"="EastGC4-EastGC4",
+                     "FC12-FC12"="EastGC2-EastGC2")
+  }
+   if(grepl("SHD", FILE)) {
+    renam <- "Hotel1"
+    keep <- c("co1-co1", "co2-co2")
+    plot.labels <- c("co1-co2"="co1-co2", "co2-co2"="co2-co2", "co1-co1"="co1-co1")
+  }
+  
+  # assign within and between
+  if (grepl("FC", FILE)) {
+    rel.df$pop <- ifelse( grepl( 'FC12', rel.df$INDV1) & grepl( 'FC12', rel.df$INDV2), "FC12-FC12", "inter")
+    rel.df$pop <- ifelse( grepl( 'FC17b', rel.df$INDV1) & grepl( 'FC17b', rel.df$INDV2), "FC17b-FC17b", rel.df$pop)
+    rel.df$pop <- ifelse( grepl( 'FC12', rel.df$INDV1) & grepl( 'FC17b', rel.df$INDV2), "FC12-FC17b", rel.df$pop)
+    rel.df$pop <- ifelse( grepl( 'FC17b', rel.df$INDV1) & grepl( 'FC12', rel.df$INDV2), "FC12-FC17b", rel.df$pop)
+  }
+  if (grepl("SHD", FILE)) {
+    shd.ids <- read.delim("~/Documents/crayfish_lab/jaredYseq2022/juvs/ids4Nb_SHD.txt", header = F)
+    shd.ids <- shd.ids %>% rename("SequenceID"=V1)
+    shd.meta <- left_join(shd.ids, juvs4colony)
+    shd.meta$cohort <- ifelse(shd.meta$DateFull %in% c("8/24/2020", "8/17/2020", "8/31-9/4/2020", "9/8-9/11/2020", "9/14-9/18/2020", "5/17-5/21/2021", "5/10-5/15/2021", "5/24/2021"), "co1", "co2")
+    shd.co1.meta <- shd.meta %>% filter(cohort == "co1")
+    shd.co2.meta <- shd.meta %>% filter(cohort == "co2")
+    rel.df$pop <- ifelse( rel.df$INDV1 %in% shd.co1.meta$SequenceID & rel.df$INDV2 %in% shd.co1.meta$SequenceID, "co1-co1", "inter")
+     rel.df$pop <- ifelse( rel.df$INDV1 %in% shd.co2.meta$SequenceID & rel.df$INDV2 %in% shd.co2.meta$SequenceID, "co2-co2", rel.df$pop)
+    rel.df$pop <- ifelse( rel.df$INDV1 %in% shd.co1.meta$SequenceID & rel.df$INDV2 %in% shd.co2.meta$SequenceID, "co1-co2", rel.df$pop)
+    rel.df$pop <- ifelse( rel.df$INDV1 %in% shd.co2.meta$SequenceID & rel.df$INDV2 %in% shd.co1.meta$SequenceID, "co1-co2", rel.df$pop)
+  }
+  
+  # get pop1 and pop2, rm comparisons bt same indivs
+  rel.df <- rel.df %>% mutate(pop1=INDV1, pop2=INDV2) %>% separate(pop1, into = c("pop1", "stuff")) %>%
+    separate(pop2, into = c("pop2", "stuff2")) %>% dplyr::select(-c(stuff, stuff2)) %>% filter(INDV1 != INDV2)
+  
+  # get mean median of Relatedness
+  rel.sum <- rel.df %>% group_by(pop) %>% summarise(meanRel=mean(RELATEDNESS_PHI), medRel=median(RELATEDNESS_PHI))
+  r_rel.mean <- rel.sum[1,2]/rel.sum[3,2]
+  r_rel.med <- rel.sum[1,3]/rel.sum[3,3] # observed median e.g.FC12-FC12/FC17b-FC17b
+    
+  df_sorted <- rel.df %>% mutate(pop = fct_reorder(pop, RELATEDNESS_PHI))
+  
+  # plot 
+  
+  
+  p1 <- ggplot(df_sorted %>% filter(pop %in% keep),aes(x=pop,y=RELATEDNESS_PHI)) +
+    geom_boxplot() +
+    #scale_y_log10()+
+    theme_bw()+
+    #ggtitle(popnam) +
+    ggtitle(renam) +
+    labs(x="",y="Rxy")+
+    scale_x_discrete(labels=plot.labels) +
+    theme(legend.position = "none",
+        axis.text = element_text(size=12,color="black"),
+        axis.text.x = element_text(size = 10, color = "black"),
+        axis.title = element_text(size=14,color = "black"),
+        strip.text = element_text(size=12,color="black"))
+  
+  rxy.list[[pltnam]] <- p1
+  
+  p1b <- ggplot(df_sorted %>% filter(pop %in% keep),aes(x=pop,y=RELATEDNESS_PHI))+
+    geom_boxplot(width = 0.2, outlier.alpha = 0.2)+ 
+    #scale_y_log10()+
+    theme_bw()+
+    #ggtitle(popnam) +
+    ggtitle(renam) +
+    labs(x="",y="Rxy")+
+    scale_x_discrete(labels=plot.labels) +
+    ggdist::stat_halfeye(
+      adjust = 0.33, width = 0.67, color = NA, position = position_nudge(x = 0.15)) +
+    theme(legend.position = "none",
+        axis.text = element_text(size=12,color="black"),
+        axis.text.x = element_text(size = 10, color = "black"),
+        axis.title = element_text(size=14,color = "black"),
+        strip.text = element_text(size=12,color="black")) +
+    coord_flip()
+  
+  p1c <- ggplot(df_sorted %>% filter(pop %in% keep) %>% filter(RELATEDNESS_PHI>=-0.5&RELATEDNESS_PHI<=0.5) ,aes(x=pop,y=RELATEDNESS_PHI))+
+    geom_boxplot(width = 0.2, outlier.alpha = 0.2)+ 
+    #scale_y_log10()+
+    geom_hline(yintercept = phi, linetype=3) +
+    theme_bw()+
+    #ggtitle(popnam) +
+    ggtitle(renam) +
+    labs(x="",y="Rxy")+
+    scale_x_discrete(labels=plot.labels) +
+    ggdist::stat_halfeye(
+      adjust = 0.33, width = 0.67, color = NA, position = position_nudge(x = 0.15)) +
+    theme(legend.position = "none",
+        axis.text = element_text(size=12,color="black"),
+        axis.text.x = element_text(size = 10, color = "black"),
+        axis.title = element_text(size=14,color = "black"),
+        strip.text = element_text(size=12,color="black")) +
+    coord_flip()
+  
+  rxy.list[[pltnam2]] <- p1c
+
+  # calculating relative relatedness among groups
+  #pop.combn <- combn(unique(rel.df$pop), 2)
+  #output.summary <- data.frame(Var1 = pop.combn[1,], Var2 = pop.combn[2,])
+  if (grepl("FC", FILE)) {
+    output.summary <- data.frame(Var1 = c("FC12-FC12", "FC12-FC12", "FC17b-FC17b", "FC12-FC17b"),
+                                Var2 = c("FC17b-FC17b", "FC12-FC17b", "FC12-FC17b", "FC12-FC17b"))
+  }
+  if (grepl("SHD", FILE)) {
+    output.summary <- data.frame(Var1 = c("co1-co1", "co1-co1", "co2-co2", "co1-co2"),
+                                Var2 = c("co2-co2", "co1-co2",  "co1-co2",  "co1-co2"))
+  }
+  
+  
+  output.summary$n1 <- NA
+  output.summary$n2 <- NA
+  output.summary$med1 <- NA
+  output.summary$med2 <- NA
+  output.summary$ratio <- NA
+  output.summary$pval <- NA
+  #output.summary
+
+  histList <- c()
+  i <- NULL
+  reps <- 1000
+  out.df <- NULL
+  for(i in 1:nrow(output.summary)){
+    print(i)
+    
+    #filtering out each group
+    out.grp1 <- rel.df[rel.df$pop == output.summary$Var1[i],]
+    out.grp2 <- rel.df[rel.df$pop == output.summary$Var2[i],]
+    
+    #getting counts of each group
+    grp1.n <- nrow(out.grp1)
+    grp2.n <- nrow(out.grp2)
+    
+    #calculating median relatedness
+    rel.grp1.mean <- mean(out.grp1$RELATEDNESS_PHI)
+    rel.grp2.mean <- mean(out.grp2$RELATEDNESS_PHI)
+    rel.grp1.med <- median(out.grp1$RELATEDNESS_PHI)
+    rel.grp2.med <- median(out.grp2$RELATEDNESS_PHI)
+    
+    #calculating the ratio
+    r_rxy.mean <- rel.grp1.mean/rel.grp2.mean
+    r_rxy.med <- rel.grp1.med/rel.grp2.med
+    #r_rxy
+    
+    #combining
+    both.out <- rbind(out.grp1,out.grp2)
+    
+    #making generic ids
+    gids <- c(rep("g1",times=grp1.n), rep("g2",times=grp2.n))
+    
+    #randomizing
+    both.out$rand <- runif(n = nrow(both.out))
+    both.out <- both.out %>% arrange(rand)
+    #both.out[both.out$off1 == "2019_Off_086" & both.out$off2 == " ",]
+    #head(both.out)
+    
+    #now for the randomization
+    out <- NULL
+    for(j in 1:reps){
+      rand.ratio <- NULL
+      both.out$mp.rand <- sample(x = gids,size = nrow(both.out),replace = F)
+      med.g1 <- median(both.out$RELATEDNESS_PHI[both.out$mp.rand == "g1"])
+      med.g2 <- median(both.out$RELATEDNESS_PHI[both.out$mp.rand == "g2"])
+      rand.ratio <- med.g1/med.g2
+      out <- c(out,rand.ratio)
+    }
+    #histList[[j]] <- hist(out)
+    #head(out)
+    
+    #saving for some graphics
+    out.df1 <- data.frame(rep = 1:length(out), relrxy = out, type = i)
+    out.df <- rbind(out.df,out.df1)
+    
+    #summarizing the data
+    output.summary$n1[i] <- grp1.n
+    output.summary$n2[i] <- grp2.n
+    output.summary$med1[i] <- rel.grp1.med
+    output.summary$med2[i] <- rel.grp2.med
+    output.summary$ratio[i] <- r_rxy.med
+    # pvalue is the proportion of permuted test statistics that are as extreme or more extreme than the observed test statistic
+    #output.summary$pval[i] <- length(which(out > r_rel.med$medRel))/reps  # one tailed
+    out.sort <- sort(out)
+    below <- sum(out.sort[1:25] < r_rel.med$medRel)
+    above <- sum(out.sort[975:1000] > r_rel.med$medRel)
+    output.summary$pval[i] <- (below + above)/reps
+    output.summary$type[i] <- i
+    #output.summary
+  }
+  
+  rxy.list[[outnam]] <- output.summary
+  
+  p2 <- ggplot(out.df %>% filter(type ==1), aes(x=relrxy))+
+    geom_histogram(fill="darkgray",color="black")+
+    geom_vline(xintercept = output.summary$ratio[1], size =2, linetype=2)+
+    ggtitle(paste0(renam, ", P-value = ", output.summary$pval)) +
+    theme_bw()+
+    labs(x="Relative Rxy",y="Number of replicates")+
+    #facet_wrap(~type) +
+    theme(legend.position = "none",
+          axis.text = element_text(size=11, color="black"),
+          axis.title = element_text(size=14)) 
+
+  rxy.list[[repplt]] <- p2
+}
+
+#writing to file
+out.summ.all <- rbind(rxy.list$FC12yFC17b.outSum, rxy.list$SHD.outSum)
+#write.table(out.summ.all, file = "~/Documents/crayfish_lab/jaredYseq2022/juvs/rxy.randomization.outsum_7-25-2024.txt",append = F,quote = F,sep = "\t",row.names = F,col.names = T)
+
+#saving to file
+out.plots <- ggarrange(rxy.list$FC12yFC17b.plot2, rxy.list$SHD.plot2, rxy.list$FC12yFC17b.rep.p, rxy.list$SHD.rep.p, labels = "AUTO")
+#ggsave(out.plots, filename = "~/Documents/crayfish_lab/jaredYseq2022/juvs/rxy.plots_7-25-2024.jpeg", device = "jpeg", width = 13, height = 10, units = "in")
+
+out.plots
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Summary of data
+```{r, message=FALSE, warning=FALSE}
+dat.vcf <-  read.vcfR(file="~/Documents/crayfish_lab/jaredYseq2022/juvs/filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf") 
+
+dat.genind <- vcfR2genind(dat.vcf, sep = "[|/]") ## Create genind object # 902 individuals; 930 SNPs
+
+```
+
+There are 902 juveniles and 930 SNPs
