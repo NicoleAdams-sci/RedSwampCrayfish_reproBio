@@ -1,0 +1,1066 @@
+---
+title: "RSC_jY22_multPaternity"
+author: "Nicole Adams"
+date: '2022-09-08'
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+# Multiple paternity
+This work flow is for analyses with berried female, hatchling, and adult male samples of invasive Red Swamp Crayfish (*P. clarkii*) sequenced in 2021 by Jared Homola and in 2022 by Nicole Adams for pedigree reconstruction and estimates of multiple paternity.
+
+&nbsp;
+
+This is for the manuscript Adams NE, Homola JJ, Sard NM, Nathan LR, Roth BM, Robinson JD, Scribner KT. 2024. Genomic data characterize reproductive ecology patterns in Michigan invasive Red Swamp Crayfish (*Procambarus clarkii*). *Evolutionary Applications*. 
+
+&nbsp;
+
+The preceding bioinformatic processing for these files can be found in RSC_genotyping_Jared-seq2022_4ms.Rmd. The original document this Rmd is based on is RSC_jY22_multPaternity.
+
+&nbsp;
+
+#### Load R libraries
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(data.table)
+library(kableExtra)
+library(ggpubr)
+library(FSA)
+
+library(vcfR)
+library(SeqArray)
+library(SNPRelate)
+
+library(ggpmisc) #stat_poly_line()
+library(corrplot)
+library(MASS) # stepAIC()
+library(car) # vif()
+library(broom) # tidy() for models
+
+```
+
+&nbsp;
+
+## Get list of successful berried females and offspring 
+Get a list of those sequenced, though they have not necessarily passed filters
+```{bash, eval=FALSE}
+# 1) combine Jared's and seq2022 berried females and offspring
+cd /mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/SHELL/dependencies
+cat ../../SHELL/dependencies/momsLarvae_2020.list > bfYoffspring_jY22_list.txt 
+cat ../../SHELL/dependencies/berriedFemales2022_list.txt >> bfYoffspring_jY22_list.txt 
+cat ../../SHELL/dependencies/offspring2022_list.txt >> bfYoffspring_jY22_list.txt 
+
+# BF I reseq'd from Jared's samples: FC17b-M2-212, FC17b-M3-212, FC17b-M4-212, SHD-M2-212
+
+# 10-12-2022 ID failed mom's (at 50% missing rm) that their offspring needs to be removed for test round of mult paternity
+#egrep -x "FC16-M7-22|FC17b-M1|FC17B-M1|FC17b-M10-22|FC17b-M3|FC17B-M3|FC17b-M4|FC17B-M4|FC17b-M8-22|FC17B-M8-22|MB1-M3-22|MB1-M4-20|MB1-M5-20|MB1-M9-20|SHD-M19-20|SHD-M2|SHD-M2-22|SHD-M20-22|SHD-M7-20" filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab.indivs
+
+ module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64
+ 
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75.vcf > bcftools query -l filteredSNPs_jY22_8-1_dp7miss75.indiv.txt
+
+```
+
+&nbsp;
+
+## Remove sites with heterozygosity > 0.6
+### Step 1: Calculate heterozygosity
+```{bash, eval=FALSE}
+#Take filteredSNPs_jY22_8-1_dp7miss75.vcf and Remove SNPs with observed heterozygosity > 0.6 * 
+#1) calc hwe 
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0  
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75.vcf --hardy --out filteredSNPs_jY22_8-1_dp7miss75.h 
+#2) 
+cat filteredSNPs_jY22_8-1_dp7miss75.h.hwe | grep -v CHR | awk -F"/" '{print $1" "$2" "$3}' | awk '{print $1" "$2" "$3" "$4" "$5}' | awk '{print $1" "$2" "$3" "$4" "$5" "$4/($3+$4+$5)}' > filteredSNPs_jY22_8-1_dp7miss75_ohz.txt 
+#3)
+cat filteredSNPs_jY22_8-1_dp7miss75.h.hwe | grep -v CHR | awk '{print $1 " "$2" "$5 " "$6 " "$7}' > filteredSNPs_jY22_8-1_dp7miss75_hwepval 
+#4)
+grep -v "^##" filteredSNPs_jY22_8-1_dp7miss75.vcf  | cut -f1-3 > filteredSNPs_jY22_8-1_dp7miss75_snpIDs 
+```
+
+&nbsp;
+
+### Step 2: Put heterozygosity in R and make list of passing sites
+```{r, warning=FALSE, message=FALSE}
+dat <- read.table("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hwepval", header=FALSE)
+dat.ohz <- read.table("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_ohz.txt", header=FALSE)
+
+dat.SNPids <- read.delim("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_snpIDs", header=TRUE)
+names(dat.SNPids) <- c("CHROM", "POS", "SNPid")
+dat.ohz <- cbind(dat.ohz, dat.SNPids$SNPid)
+
+
+names(dat.ohz) <- c("CHR", "POS", "AA", "AB", "BB", "Ho", "SNPid")
+
+filtered.ohz <- subset(dat.ohz, AB >= 1 & Ho <= 0.6)
+
+bed_filtered.ohz <- data.frame(CHR = filtered.ohz$CHR, START = filtered.ohz$POS-1, END = filtered.ohz$POS)
+
+snpIDs.filtered.ohz <- data.frame(snp = filtered.ohz$SNPid)
+
+#write.table(snpIDs.filtered.ohz, "~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_snpIDs.filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+#write.table(bed_filtered.ohz, "~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_bed_filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+```
+
+&nbsp;
+
+### Step 3: Filter VCF based on passing sites
+```{bash, eval=FALSE}
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75.vcf --snps filteredSNPs_jY22_8-1_dp7miss75_snpIDs.filtered.ohz --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.vcf
+
+egrep -v "^#" filteredSNPs_jY22_8-1_dp7miss75_hz.vcf | wc -l # 8041
+```
+
+&nbsp;
+
+## Remove SNPs with allele balance values >0.6 or <0.4 
+### Step 1: Make list of passing SNPs 
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+#### Filter based on allele balance ####
+#vcf_file <- "~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz.vcf"
+#seqVCF2GDS(vcf.fn = vcf_file, "~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz.gds", verbose = FALSE)
+open_GDS <- seqOpen("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz.gds", readonly = TRUE)
+
+# - Get sample info
+sample_info <- as.data.frame(read.gdsn(index.gdsn(open_GDS, "sample.id")), quote=FALSE)
+
+# data prep
+dat <- read.vcfR("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz.vcf")
+tidyDat <- vcfR2tidy(dat)
+
+tmp <- tidyDat$gt %>%  dplyr::select(ChromKey, POS, Indiv, gt_GT)
+
+tmp2 <- tidyDat$fix %>% dplyr::select(ChromKey, CHROM, POS, ID)
+
+positionFilter <- left_join(tmp, tmp2, by = c("ChromKey", "POS")) %>%
+ mutate(population = substr(Indiv, 1, 5)) %>%
+ dplyr::select(CHROM, POS, ID) %>%
+ distinct(ID, .keep_all = TRUE) %>%
+ separate(ID, c("tag", "position", NA)) %>%
+ mutate(position = as.numeric(position))
+
+
+
+# Get allele balance
+geno_matrix.012 <-snpgdsGetGeno(open_GDS)
+het_matrix <- geno_matrix.012
+het_matrix[which(geno_matrix.012 != 1)] <- 0
+het_matrix[which(is.na(geno_matrix.012))] <- 0
+is.odd <- function(x) x %% 2 != 0
+AD <- seqGetData(open_GDS, "annotation/format/AD")
+AD <- as.data.frame(AD$data)
+ref_c <- AD[,is.odd(seq(1, ncol(AD), 1))]
+alt_c <- AD[,!is.odd(seq(1, ncol(AD), 1))]
+reads <- ref_c + alt_c
+ab1 <- (alt_c/reads)*het_matrix
+ab <- colSums(ab1, na.rm = T)/ colSums(het_matrix)
+hist(ab)
+
+# Make a list of markers that pass
+as_tibble(ab) %>% 
+  mutate(AB = ab) %>%
+  bind_cols(positionFilter) %>%  ### From SNP count filtering above
+  filter(AB > 0.4, 
+         AB < 0.6) %>% #position < 141
+  drop_na() %>% 
+  dplyr::select(CHROM, POS) #%>% 
+  #write.table("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz_abFilterPass.txt",
+     #         quote = FALSE,
+      #        row.names = FALSE,
+       #       col.names = FALSE)
+
+showfile.gds(closeall=TRUE)
+```
+
+&nbsp;
+
+### Step 2: Filter VCF based on passing SNPs
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0 
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.vcf --positions filteredSNPs_jY22_8-1_dp7miss75_hz_abFilterPass.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab.vcf 
+
+egrep -v "^#" filteredSNPs_jY22_8-1_dp7miss75_hz.ab.vcf | wc -l # 5,362 sites 
+
+```
+
+&nbsp;
+
+# Further filter VCF for multiple paternity analyses
+## Filter individual missingness at 75%
+```{bash, eval=FALSE}
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64 
+
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75_hz.ab.vcf > filteredSNPs_jY22_8-1_dp7miss75_hz.ab.indiv.txt
+
+# remove individuals with >75 missing data
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab.vcf --missing-indv --out filteredSNPs_jY22_8-1_dp7miss75_hz.ab
+
+cat filteredSNPs_jY22_8-1_dp7miss75_hz.ab.imiss | awk '$5 < 0.75' | awk '{print $1}' > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.list # 3002
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab.vcf --keep filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.list --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.vcf
+ 
+grep -v "#" filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.vcf | wc -l #5362
+
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64 
+
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.vcf > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.indiv.txt
+```
+
+&nbsp;
+
+## Filter VCF for berried females, hatchlings, adult males
+```{r, warning=FALSE, message=FALSE}
+indiv.df <- read.delim("~/Documents/crayfish_lab/jaredYseq2022/filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.indiv.txt", header = F)
+
+indiv.df <- indiv.df %>% mutate(pop=V1) %>% separate(pop, into = c("POP", "stuff")) %>% dplyr::select(-stuff)
+
+# Fix name discrepancies
+indiv.df$V1 <- gsub("FC815-212", "FC8-15-212", indiv.df$V1)
+indiv.df$V1 <- gsub("FC17B", "FC17b", indiv.df$V1)
+#indiv.df$V1 <- gsub("SHD-M24", "SHD-M14", indiv.df$V1)
+indiv.df$V1 <- gsub("FC9B", "FC9b", indiv.df$V1)
+
+# meta.df[grepl(glob2rx('*-M*-J*'), meta.df$SequenceID),]
+
+bf.2022 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/berriedFemales2022_meta.txt", header = T)
+off.2022 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/offspring2022_meta.txt", header = T)
+adults.2022 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/adult2022_meta.txt", header = T)
+males.2022 <- adults.2022 %>% filter(Sex =="M")
+
+  
+bf.2020 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/bf2020_meta.txt", header = T)
+bf.2020 <- bf.2020 %>% mutate(SequenceID=Sample_ID)
+bf.2020 <- bf.2020 %>% mutate(DateFinal = paste0(Date2, "-2020"))
+bf.2020$DateFinal <- lubridate::mdy(bf.2020$DateFinal)
+
+off.2020 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/off2020_meta.txt", header = T)
+off.2020 <- off.2020 %>% mutate(SequenceID=Sample_ID)
+off.2020 <- off.2020 %>% mutate(DateFinal = paste0(Date2, "-2020"))
+off.2020$DateFinal <- lubridate::mdy(off.2020$DateFinal)
+
+adults.2020 <- read.delim("~/Documents/crayfish_lab/RSCseq2022/adults2020_meta.txt", header = T)
+males.2020 <- adults.2020 %>% filter(Sex =="M")
+males.2020 <- males.2020 %>% mutate(SequenceID=Sample_ID)
+
+
+bf.all <- full_join(bf.2020, bf.2022)
+off.all <- full_join(off.2020, off.2022)
+males.all <- full_join(males.2020, males.2022)
+
+bf.off.all <- full_join(bf.all, off.all)
+#bf.off.m.all <- full_join(bf.off.all, males.all)
+
+bfYoff4colonyA <- bf.off.all %>% filter(SequenceID %in% indiv.df$V1) 
+
+
+# look for duplicate BF
+seqBF <- bfYoff4colonyA %>% filter(stage == "berriedFemale") %>% arrange(SequenceID)
+
+# Remove offspring without BF
+ #paste(seqBF$SequenceID, collapse="|")
+#bfKeepers <- c("FC12-M4-20|FC16-M1-22|FC16-M4-22|FC16-M5-22|FC16-M6-22|FC16-M8-22|FC17b-M2|FC17b-M3-212|FC17b-M2-212|FC17b-M7-22|FC17b-M9-22|MB1-M1-22|MB1-M2-22|MB1-M6-22|MB1-M7-20|MB1-M7-22|SHD-M1|SHD-M1-22|SHD-M13-20|SHD-M14-20|SHD-M18-20")
+#offKeepers <- c("FC12-M4-J*-20|FC16-M1-J*-22|FC16-M4-J*-22|FC16-M5-J*-22|FC16-M6-J*-22|FC16-M8-J*-22|FC17b-M2-J*|FC17b-M3-J*-212|FC17b-M2-J*-212|FC17b-M7-J*-22|FC17b-M9-J*-22|MB1-M1-J*-22|MB1-M2-J*-22|MB1-M6-J*-22|MB1-M7-J*-20|MB1-M7-J*-22|SHD-M1-J*|SHD-M1-J*-22|SHD-M13-J*-20|SHD-M14-J*-20|SHD-M18-J*-20")
+
+bfKeepers <- c("FC12-M4-20|FC16-M1-22|FC16-M4-22|FC16-M5-22|FC16-M6-22|FC16-M8-22|FC17b-M2-212|FC17b-M3-212|FC17b-M4-212|FC17b-M7-22|FC17b-M9-22|MB1-M1-22|MB1-M2-22|MB1-M3-22|MB1-M6-22|MB1-M7-20|MB1-M7-22|SHD-M1|SHD-M1-22|SHD-M13-20|SHD-M14-20|SHD-M18-20|SHD-M19-20")
+offKeepers <- c("FC12-M4-J*-20|FC16-M1-J*-22|FC16-M4-J*-22|FC16-M5-J*-22|FC16-M6-J*-22|FC16-M8-J*-22|FC17b-M2-J*|FC17b-M3-J*|FC17b-M4-J*|FC17b-M7-J*-22|FC17b-M9-J*-22|MB1-M1-J*-22|MB1-M2-J*-22|MB1-M3-J*-22|MB1-M6-J*-22|MB1-M7-J*-20|MB1-M7-J*-22|SHD-M1-J*|SHD-M1-J*-22|SHD-M13-J*-20|SHD-M14-J*-20|SHD-M18-J*-20|SHD-M19-J*-20")
+
+
+bfYoff4colonyB <- bfYoff4colonyA[grepl(glob2rx(bfKeepers), bfYoff4colonyA$SequenceID),]
+bfYoff4colonyC <- bfYoff4colonyA[grepl(glob2rx(offKeepers), bfYoff4colonyA$SequenceID),]
+
+bfYoff4colonyD <- full_join(bfYoff4colonyB, bfYoff4colonyC)
+
+
+#bfYoffYdads4colony <- full_join(bfYoffYdads4colonyD, bfYoffYdads4colonyA %>% filter(Sex == "M") %>% filter(Site_Abbrev %in% c("FC12", "FC16", "FC17b", "MB1", "SHD")))
+
+# males
+males4colony <- males.all %>% filter(Site_Abbrev %in% c("FC12", "FC16", "FC17b", "MB1", "SHD"))
+
+bfYoffYdad4colony <- full_join(bfYoff4colonyD, males4colony)
+
+bfYoffYdad4colony$SequenceID <- gsub("FC17b-M7", "FC17B-M7", bfYoffYdad4colony$SequenceID)
+
+#write.table(bfYoffYdad4colony %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+
+bfYoffYdad4colony.FC12 <- bfYoffYdad4colony %>% filter(Site_Abbrev=="FC12")
+bfYoffYdad4colony.FC16 <- bfYoffYdad4colony %>% filter(Site_Abbrev=="FC16")
+bfYoffYdad4colony.FC17b <- bfYoffYdad4colony %>% filter(Site_Abbrev=="FC17b")
+bfYoffYdad4colony.MB1 <- bfYoffYdad4colony %>% filter(Site_Abbrev=="MB1")
+bfYoffYdad4colony.SHD <- bfYoffYdad4colony %>% filter(Site_Abbrev=="SHD")
+
+# write.table(bfYoffYdad4colony.FC12 %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.FC12.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+# write.table(bfYoffYdad4colony.FC16 %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.FC16.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+# write.table(bfYoffYdad4colony.FC17b %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.FC17b.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+# write.table(bfYoffYdad4colony.MB1 %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.MB1.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+# write.table(bfYoffYdad4colony.SHD %>% select(SequenceID), file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/jY22_bfYoffYdad4colony.SHD.txt"), sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+
+#### meta for sample table!
+bf.off.males <- full_join(bf.off.all, males4colony)
+
+# write.table(bf.off.males, file=paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/MP4sampleTable.txt"), sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# fix sample info
+bf.off.males$Sex <- ifelse(bf.off.males$stage == "berriedFemale", "F", bf.off.males$Sex)
+bf.off.males$Site_Abbrev <- ifelse(bf.off.males$SequenceID == "MB1-M4-20", "MB1", bf.off.males$Site_Abbrev)
+
+bf.off.males.tab <- bf.off.males %>% group_by(Site_Abbrev, stage) %>% tally()
+bf.off.males.tab2 <- pivot_wider(bf.off.males.tab, names_from = Site_Abbrev, values_from = n)
+bf.off.males.tab2$stage <- gsub(pattern="adult", replacement = "adult_males", bf.off.males.tab2$stage)
+
+kable(bf.off.males.tab2) %>% kable_styling()
+
+```
+
+&nbsp;
+
+## Filter and convert to GT format
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0  
+
+#cat 2020_SHD_FC17b_males.txt > 2020_SHD_FC17b_momsYdadsYlarvae.txt 
+#cat /mnt/research/Scribner_Lab/projects/RedSwampCrayfish_MISGP/SHELL/dependencies/momsLarvae.list >> 2020_SHD_FC17b_momsYdadsYlarvae.txt
+
+#vcftools --vcf indFiltered.vcf --keep 2020_SHD_FC17b_momsYdadsYlarvae.txt --recode --recode-INFO-all --stdout > 2020_SHD_FC17b_momsYdadsYlarvae.vcf 
+
+#vcftools --vcf  2020_SHD_FC17b_momsYdadsYlarvae.vcf --thin 10000 --maf 0.3 --minDP 20 --recode --recode-INFO-all --stdout > 2020_SHD_FC17b_momsYdadsYlarvae.thinned.vcf 
+ 
+#vcftools --vcf 2020_SHD_FC17b_momsYdadsYlarvae.thinned.vcf --extract-FORMAT-info GT --out 2020_SHD_FC17b_momsYdadsYlarvae.thinned
+
+cd /mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/OUT/genotyped/multPaternity
+
+vcftools --vcf ../filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75.vcf --keep jY22_bfYoffYdad4colony.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad.vcf #899 5362
+
+vcftools --vcf  filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad.vcf --maf 0.3 --minDP 20 --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf #899 484
+
+# split VCF by population
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf --keep jY22_bfYoffYdad4colony.FC12.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC12.vcf 
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf --keep jY22_bfYoffYdad4colony.FC16.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC16.vcf 
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf --keep jY22_bfYoffYdad4colony.FC17b.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC17b.vcf 
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf --keep jY22_bfYoffYdad4colony.MB1.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_MB1.vcf 
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf --keep jY22_bfYoffYdad4colony.SHD.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_SHD.vcf 
+
+```
+
+&nbsp;
+
+### Select best SNPs per RAD Tag in R
+Best SNP defined as the marker with the lowest missing then highest maf per RAD tag, and if there's a tie take the first one.
+```{r, warning=FALSE, message=FALSE}
+bf.files<-list.files(path="~/Documents/crayfish_lab/jaredYseq2022/multPaternity", pattern='*.vcf', full.names = TRUE)
+
+bfList <- list()
+for (FILE in bf.files){
+  POPnm <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(18)]
+  outName <- paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_", POPnm, ".1pTag.txt")
+  bfs <- read.vcfR(FILE)
+
+# calc maf
+    bfs.mafA <- as.data.frame(maf(bfs))
+  bfs.maf <- bfs.mafA %>% mutate(tag=rownames(bfs.mafA)) %>% separate(tag, into = c("tag", "position", "stuff"), sep = ":") %>% dplyr::select(-stuff) %>% rename("maf.frq" =Frequency) %>% mutate(position = as.numeric(position)) %>% mutate(tag = as.numeric(tag))
+  
+# calc missingness per variant
+  dp <- extract.gt(bfs, element = "DP", as.numeric=TRUE)
+  myMiss <- apply(dp, MARGIN = 1, function(x){ sum(is.na(x)) })
+  myMiss <- myMiss/ncol(bfs@gt[,-1])
+  myMiss.df <- as.data.frame(cbind(names(myMiss), myMiss))
+  bfs.miss <- myMiss.df %>% separate(V1, into = c("tag", "position", "stuff"), sep = ":") %>% dplyr::select(-stuff) %>% rename("missingness" =myMiss) %>% mutate(position = as.numeric(position)) %>% mutate(tag = as.numeric(tag))
+  
+  
+  # data prep
+  tidyBFs <- vcfR2tidy(bfs)
+
+  tmpBF <- tidyBFs$gt %>% dplyr::select(ChromKey, POS, Indiv, gt_GT)
+
+  tmpBF2 <- tidyBFs$fix %>% dplyr::select(ChromKey, CHROM, POS, ID)
+
+  positionFilter <- left_join(tmpBF, tmpBF2, by = c("ChromKey", "POS")) %>%
+   mutate(population = substr(Indiv, 1, 5)) %>%
+   dplyr::select(CHROM, POS, ID) %>%
+   distinct(ID, .keep_all = TRUE) %>%
+   separate(ID, c("tag", "position", NA)) %>%
+   mutate(position = as.numeric(position)) %>%
+   mutate(tag = as.numeric(tag))
+  
+  
+  bfs.all <- full_join(bfs.maf, bfs.miss, by=c("tag", "position")) %>% dplyr::select(-c(nAllele, "NA", Count))
+  positionFilter2 <- left_join(positionFilter, bfs.all, by=c("tag", "position")) %>% mutate(missingness = as.numeric(missingness))
+  
+  
+  # Make a list of markers that pass
+  positionFilter3 <- positionFilter2 %>% group_by(tag) %>%
+  filter(missingness == min(missingness)) %>% 
+   filter(maf.frq == max(maf.frq)) %>%
+   filter(1:n() == 1)  %>%  # take first occurrence 
+   dplyr::select(CHROM, POS) # adds tag bc group, could use ungroup or just select col 2 and 3
+
+  # write.table(positionFilter3[,2:3], outName,
+  #             quote = FALSE,
+  #             row.names = FALSE,
+  #             col.names = FALSE,
+  #             sep = '\t')
+  
+  bfList[[POPnm]] <- positionFilter3
+}
+
+```
+
+&nbsp;
+
+### Filter VCF with best SNP per RAD tag and convert to GT format
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0
+
+vcftools --vcf filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC12.vcf --positions filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC12.1pTag.txt --recode --recode-INFO-all --stdout > filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_FC12.1pTag.vcf
+
+for FILE in `ls filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_*.vcf`; do sample=`ls $FILE |cut -f1,2 -d'.'` ; echo $sample ; vcftools --vcf $FILE --positions $sample\.1pTag.txt --recode --recode-INFO-all --stdout > $sample\.1pTag.vcf; done
+
+for FILE in filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_*.1pTag.vcf; do echo $FILE; egrep -v "^#" $FILE | wc -l; done #310
+
+
+# Get GT format vcf file
+for FILE in filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_*.1pTag.vcf; do echo $FILE; vcftools --vcf $FILE --extract-FORMAT-info GT --out ${FILE%.*}; done
+
+# get list of samples
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64
+
+bcftools query -l filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag.vcf > filteredSNPs_jY22_8-1_dp7miss75miss50_hz.ab_juvs_maf005dp20_1pTag_IDs.txt #902
+
+```
+
+&nbsp;
+
+## Modified vcf_colony.R
+John Robinson modified original vcf_colony.R script to include separate entries for candidate moms and dads for RSC
+```{r, message=FALSE, warning=FALSE}
+vcf_colony <- function(vcf,empty = T){
+  #sorting data for COLONY and reformatting genotypes
+  vcf$gt <- gsub(pattern = "1/1",replacement = "2/2",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "0/0",replacement = "1/1",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "0/1",replacement = "1/2",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "\\./\\.",replacement = "0/0",x = vcf$gt)
+  vcf$gt <- gsub(pattern = "NA",replacement = "0/0",x = vcf$gt, fixed = T)
+  
+  #separating genotypes into alleles and then merging them together
+  #allele one
+  a1 <- vcf %>% 
+    separate(col = gt,into = c("a","b"),sep = "/") %>%
+    dplyr::select(-b) %>%
+    spread(key = "locus",value = "a")
+  colnames(a1) <- paste0(colnames(a1),".1")
+  names(a1)[1] <- "id"
+  
+  #allele two
+  a2 <- vcf %>% 
+    separate(col = gt,into = c("a","b"),sep = "/") %>%
+    dplyr::select(-a) %>%
+    spread(key = "locus",value = "b")
+  colnames(a2) <- paste0(colnames(a2),".2")
+  names(a2)[1] <- "id"
+  
+  #merging on IDs
+  colony <- merge(a1,a2,by="id") 
+  colony <- colony %>% dplyr::select(sort(colnames(colony)))
+  
+  if(empty == T){
+    colony1 <- colony %>% 
+      gather(key = locus,value = gt, -id)
+    colony1 <- colony1 %>% 
+      mutate(gtcheck = ifelse(colony1$gt == "0",0,1)) %>% 
+      group_by(id) %>% 
+      summarise(sums = sum(gtcheck),
+                empty = ifelse(sums == 0,T,F))
+    
+    colony$empty <- colony1$empty
+    colony <- colony %>% 
+      filter(empty == F) %>% 
+      dplyr::select(-empty)
+    
+  }
+  colony
+}
+
+marker_create <- function(SNPs,cod = 0,gte = 0.02,ote = 0.001){
+  #making a matrix of zeros of the correct size and adding colnames
+  nmarkers <- (length(SNPs)-1)/2
+  markers  <- data.frame(matrix(data = 0,nrow = 3,ncol = nmarkers))
+  colnames(markers) <- SNPs[seq(from=2, to = nmarkers*2,by = 2)]
+  
+  #filling in matrix
+  markers[1,] <- cod #for co-dominant markers
+  markers[2,] <- gte # genotyping error
+  markers[3,] <- ote #other types of error
+  
+  #output
+  markers
+}
+
+colonydat_create <- function(moms = NA, dads = NA, kids, markers, update.alfs = 0,
+                             spp.type = 2, inbreeding = 0, ploidy = 0, fem.gamy = 1, mal.gamy = 1,
+                             clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 1,
+                             run.length = 2, monitor = 0, windows.version = 0, full.likelihood = 1,
+                             likelihood.precision = 2, prob.mom = 1.0, prob.dad = 1.0,output_file = "colony2.dat"){
+  options(scipen = 999)
+  #getting current working directory and fixing slashes for running on linux
+  my.wd <- "'Input.data'"
+  my.wd2 <- "'Output.data'" 
+  
+  #getting the number of kids, moms, and dads
+  noff1 <- nrow(kids); nmoms <- nrow(moms); ndads <- nrow(dads)
+  noff <- paste(noff1,"! Number of offspring in the sample",sep = "\t")
+  
+  #getting the number of loci
+  nloci <- ncol(markers)
+  nloci <- paste(nloci, "! Number of loci",sep = "\t") 
+  
+  #setting a random number seed
+  random.seed <- round(runif(n = 1,min = 1,max = 9999))
+  random.seed <- paste(random.seed, "! Seed for random number generator",sep = "\t")
+  
+  #adding comments to input parameters
+  update.alfs <- paste(update.alfs,"! Not upate/update allele frequency",sep = "\t")
+  spp.type <- paste(spp.type, "! 2/1=Dioecious/Monoecious",sep = "\t")
+  inbreeding <- paste(inbreeding,"! 0/1=No inbreeding/inbreeding", sep = "\t")
+  ploidy <- paste(ploidy, "! 0/1=Diploid species/HaploDiploid species",sep="\t")
+  gamy <- paste(paste(mal.gamy,fem.gamy),"! 0/1=Polygamy/Monogamy for males & females",sep = "\t")
+  clone <- paste(clone,"! 0/1=Clone inference =No/Yes",sep="\t")
+  sib.scale <- paste(sib.scale,"! 0/1=Scale full sibship=No/Yes",sep = "\t")
+  sib.prior <- paste(sib.prior,"! 0/1/2/3=No sibship prior/Weak sibship prior/Medium sibship prior/Strong sibship prior",sep = "\t")
+  known.alfs <- paste(known.alfs,"! 0/1=Unknown/Known population allele frequency",sep = "\t")
+  run.number <- paste(run.number,"! Number of runs",sep = "\t")
+  run.length <- paste(run.length,"! Length of run",sep = "\t")
+  monitor <- paste(monitor,"! 0/1=Monitor method by Iterate#/Time in second",sep = "\t")
+  monitor.interval <- paste(1000000,"! Monitor interval in Iterate# / in seconds",sep = "\t")
+  windows.version <- paste(windows.version,"! Windows version",sep = "\t")
+  full.likelihood <- paste(full.likelihood,"! Fulllikelihood",sep = "\t")
+  likelihood.precision <- paste(likelihood.precision,"! 1/2/3=low/medium/high Precision for Fulllikelihood",sep = "\t")
+  
+  #collating info for parents
+  if(prob.dad == 0 & prob.mom == 0){
+    probs <- c("0.0","0.0")
+  } else {
+    probs <- c(prob.dad,prob.mom)
+  }
+  
+  npars <- c(0,0)
+  if(!is.na(dads)) {npars[1] <- nrow(dads)}
+  if(!is.na(moms)) {npars[2] <- nrow(moms)}
+  
+  my.value <- paste0(0,"\n")
+  my.exc.value <- paste(0,0,"\n")
+  #making the actual file
+  cat(my.wd,my.wd2,noff,nloci,random.seed, update.alfs,spp.type,
+      inbreeding,ploidy,gamy,clone,sib.scale,sib.prior,
+      known.alfs,run.number,run.length,monitor,monitor.interval,
+      windows.version,full.likelihood,likelihood.precision,file = output_file,sep = "\n",append = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = markers,file = output_file,append = T,quote = F,sep = ",",row.names = F,col.names = T)
+  cat("\n",file = output_file,append = T)
+  write.table(x = kids,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  cat("\n",file = output_file,append = T)
+  cat(probs,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(npars,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  if(!is.na(dads) ){
+    cat("\n",file = output_file,append = T)
+    write.table(x = dads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  if(!is.na(moms)){
+    cat("\n",file = output_file,append = T)
+    write.table(x = moms,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+}
+
+```
+
+&nbsp;
+
+## Modified colony_create() add dyads
+John Robinson modified original colony_create function to include dyads for RSC
+```{r, message=FALSE, warning=FALSE}
+colonydat_create2 <- function(moms = NA, dads = NA, kids, dyads, markers, update.alfs = 0,
+                             spp.type = 2, inbreeding = 0, ploidy = 0, fem.gamy = 1, mal.gamy = 1,
+                             clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 1,
+                             run.length = 2, monitor = 0, windows.version = 0, full.likelihood = 1,
+                             likelihood.precision = 2, prob.mom = 1.0, prob.dad = 1.0,output_file = "colony2.dat"){
+  options(scipen = 999)
+  #getting current working directory and fixing slashes for running on linux
+  my.wd <- "'Input.data'"
+  my.wd2 <- "'Output.data'" 
+  
+  #getting the number of kids, moms, and dads
+  noff1 <- nrow(kids); nmoms <- nrow(moms); ndads <- nrow(dads)
+  noff <- paste(noff1,"! Number of offspring in the sample",sep = "\t")
+  
+  #getting the number of loci
+  nloci <- ncol(markers)
+  nloci <- paste(nloci, "! Number of loci",sep = "\t") 
+  
+  #getting the number of maternity dyads (NEA)
+  ndyads <- nrow(dyads)
+  ndyads <- paste(ndyads, "! Number of offspring with known mother",sep = "\t") 
+    
+  #setting a random number seed
+  random.seed <- round(runif(n = 1,min = 1,max = 9999))
+  random.seed <- paste(random.seed, "! Seed for random number generator",sep = "\t")
+  
+  #adding comments to input parameters
+  update.alfs <- paste(update.alfs,"! Not upate/update allele frequency",sep = "\t")
+  spp.type <- paste(spp.type, "! 2/1=Dioecious/Monoecious",sep = "\t")
+  inbreeding <- paste(inbreeding,"! 0/1=No inbreeding/inbreeding", sep = "\t")
+  ploidy <- paste(ploidy, "! 0/1=Diploid species/HaploDiploid species",sep="\t")
+  gamy <- paste(paste(mal.gamy,fem.gamy),"! 0/1=Polygamy/Monogamy for males & females",sep = "\t")
+  clone <- paste(clone,"! 0/1=Clone inference =No/Yes",sep="\t")
+  sib.scale <- paste(sib.scale,"! 0/1=Scale full sibship=No/Yes",sep = "\t")
+  sib.prior <- paste(sib.prior,"! 0/1/2/3=No sibship prior/Weak sibship prior/Medium sibship prior/Strong sibship prior",sep = "\t")
+  known.alfs <- paste(known.alfs,"! 0/1=Unknown/Known population allele frequency",sep = "\t")
+  run.number <- paste(run.number,"! Number of runs",sep = "\t")
+  run.length <- paste(run.length,"! Length of run",sep = "\t")
+  monitor <- paste(monitor,"! 0/1=Monitor method by Iterate#/Time in second",sep = "\t")
+  monitor.interval <- paste(1000000,"! Monitor interval in Iterate# / in seconds",sep = "\t")
+  windows.version <- paste(windows.version,"! Windows version",sep = "\t")
+  full.likelihood <- paste(full.likelihood,"! Fulllikelihood",sep = "\t")
+  likelihood.precision <- paste(likelihood.precision,"! 1/2/3=low/medium/high Precision for Fulllikelihood",sep = "\t")
+  
+  #collating info for parents
+  if(prob.dad == 0 & prob.mom == 0){
+    probs <- c("0.0","0.0")
+  } else {
+    probs <- c(prob.dad,prob.mom)
+  }
+  
+  npars <- c(0,0)
+  if(!is.na(dads)) {npars[1] <- nrow(dads)}
+  if(!is.na(moms)) {npars[2] <- nrow(moms)}
+  
+  my.value <- paste0(0,"\n")
+  my.exc.value <- paste(0,0,"\n")
+  #making the actual file
+  cat(my.wd,my.wd2,noff,nloci,random.seed, update.alfs,spp.type,
+      inbreeding,ploidy,gamy,clone,sib.scale,sib.prior,
+      known.alfs,run.number,run.length,monitor,monitor.interval,
+      windows.version,full.likelihood,likelihood.precision,file = output_file,sep = "\n",append = T)
+  cat("\n",file = output_file,append = T)
+  #write.table(x = markers,file = output_file,append = T,quote = F,sep = ",",row.names = F,col.names = T)
+  cat("\n",file = output_file,append = T)
+  #write.table(x = kids,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  cat("\n",file = output_file,append = T)
+  cat(probs,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(npars,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  if(!is.na(dads) ){
+    cat("\n",file = output_file,append = T)
+   # write.table(x = dads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  if(!is.na(moms)){
+    cat("\n",file = output_file,append = T)
+   # write.table(x = moms,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.exc.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  cat("\n",file = output_file,append = T)
+  cat(my.value,file = output_file,append = T)
+  if(!is.na(dyads)){
+    cat("\n",file = output_file,append = T)
+  #  write.table(x = dyads,file = output_file,append = T,quote = F,sep = " ",row.names = F,col.names = F)
+  }
+}
+
+```
+
+&nbsp;
+
+## Convert mom, dad, offspring data to Colony format per population
+*Warning: if run more than once colonyDat_create() will append file to existing file*
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+col.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/multPaternity/", pattern='*1pTag.GT.FORMAT', full.names = TRUE)
+
+colList <- list()
+for (FILE in col.files){
+  POP <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(18)]
+  outName <- paste0("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20_", POP,".1pTag.mdl.dat")
+ 
+  datx <- read_delim(FILE, delim = "\t") 
+  
+  datx2 <- datx %>% pivot_longer(cols = 3:ncol(datx),  
+                             names_to = "ind", 
+                             values_to = "gt") %>%  
+  mutate(locusA = paste0(CHROM,POS)) %>% 
+  mutate(locus = paste0("L", as.numeric(as.factor(locusA)))) %>% # better way to do this?
+  dplyr::select(locus, ind, gt) 
+  
+  # test getting a maternity dyad ("on each row list a single dyad containing the offspring ID followed by its known mother ID") - probs a better way....
+  # indivs <- unique(datx2$ind)
+  # hello <- grepl('J', indivs)
+  # indivs2 <- as.data.frame(indivs[ indivs = hello ])
+  # colnames(indivs2) <- "off"
+  # indivs2$off <- as.character(indivs2$off)
+  # indivs2$mom <- strsplit(sub('(^[^-]+-[^-]+)-(.*)$', '\\1 \\2', indivs2$off), ' ')
+  # indivs2$mom <- sapply(indivs2$mom, getElement, 1)
+
+  
+  offName <- paste('colonyDat', POP, 'off', sep = '.' )
+  momName <- paste('colonyDat', POP, 'moms', sep = '.' )
+  dadName <- paste('colonyDat', POP, 'dads', sep = '.' )
+  dyadName <- paste('colonyDat', POP, 'matDyad', sep = '.' )
+  dat.pop <- datx2 %>% filter(grepl(POP, ind))
+  off.dat <- dat.pop %>% filter(grepl('J', ind))
+  mom.dat <- dat.pop %>% filter(!grepl('J', ind)) %>% filter(grepl('-M', ind))
+  dad.dat <- dat.pop %>% filter(!grepl('J', ind)) %>% filter(!grepl('-M', ind))
+  
+  # colList[[ offName ]] <- vcf_colony(off.dat) 
+  # colList[[ momName ]] <- vcf_colony(mom.dat) 
+  # colList[[ dadName ]] <- vcf_colony(dad.dat) 
+  
+  off.df <- vcf_colony(off.dat) 
+  mom.df <- vcf_colony(mom.dat) 
+  dad.df <- vcf_colony(dad.dat) 
+  
+  indivs <- unique(dat.pop$ind)
+  hello <- grepl('J', indivs)
+  indivs2 <- as.data.frame(indivs[ indivs = hello ])
+  colnames(indivs2) <- "off"
+  indivs2$off <- as.character(indivs2$off)
+  #indivs2$mom <- strsplit(sub('(^[^-]+-[^-]+)-(.*)$', '\\1 \\2', indivs2$off), ' ')
+  #indivs2$mom <- sapply(indivs2$mom, getElement, 1)
+  indivs3 <- indivs2 %>% mutate(MOM=off) %>% separate(MOM, into = c("mom1", "mom2", "J", "year"))  %>% mutate(mom=ifelse(is.na(year)==TRUE, paste0(mom1,"-", mom2), paste0(mom1, "-",mom2,"-", year))) %>% dplyr::select(off, mom)
+  
+  #colList[[ dyadName ]] <- indivs2
+  dyad.df <- indivs3 
+
+
+  markers_mdl <- marker_create(unique(datx2$locus), cod = 0, gte = 0.01, ote = 0.001) 
+
+  colonydat_create2(moms = mom.df, dads = dad.df, kids=off.df, markers=markers_mdl, dyads=dyad.df, update.alfs = 0,
+                 spp.type = 2, inbreeding = 1, ploidy = 0, fem.gamy = 0, mal.gamy = 0,
+                 clone = 0, sib.scale = 1, sib.prior = 0, known.alfs = 0, run.number = 3,
+                 run.length = 3, monitor = 0, windows.version = 0, full.likelihood = 1,
+                 likelihood.precision = 2, prob.mom = 0.99, prob.dad = 0.01,
+                 output_file = outName)
+  
+}
+
+
+```
+
+&nbsp;
+
+### Run berried females, adult males, and offspring through Colony per population
+```{bash, eval=FALSE}
+#!/bin/sh
+#SBATCH --ntasks=1
+#SBATCH -t 12:00:00
+#SBATCH -N 1 -c 8
+#SBATCH --mem 30G
+#SBATCH -J colony
+##SBATCH -o '$RUN_PATH'/colony.'$POP'.o
+#SBATCH --output=colony.%j.out
+#SBATCH --error=colony.%j.err
+#SBATCH --mail-type=END
+#SBATCH --mail-user=NicoleAdams.sci@gmail.com
+
+## A pop with 507 samples took ~24 hours
+
+FILE=$1
+POP=$2
+
+##loading modules (Modules and Colony on HPCC)
+module purge
+ml -* icc/2018.1.163-GCC-6.4.0-2.28  impi/2018.1.163  COLONY/2.0.6.7
+
+#Where you want to run colony for all your runs (if coped over all .dat files from a single directory)
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/OUT/genotyped/multPaternity
+
+#Where your colony path is located (or where ever you copy your .dat files to)
+#cd '$RUN_PATH'/COLONY/
+
+#creates a folder for each population
+mkdir "$POP"
+
+#Copies colony.dat file to new population folder (if in main folder). Be sure to rename your .Dat files accordingly (name should match POP name)
+cp "$FILE" "$POP"
+
+#Directs command line to the population folder once .DAT file has been moved
+cd $RUN_PATH/$POP
+
+#Runs COLONY based in the above redirect
+mpirun -n 8 colony2p IFN:$FILE
+#mpirun -n 8 colony2p IFN:colony2.mdl.SHD_dyad.dat
+
+#Outputs diagnostic file to a desired location
+#scontrol show job ${SLURM_JOB_ID}' > $RUN_PATH/SHELL/colony."$POP".sh
+
+#sbatch $RUN_PATH/SHELL/colony."$POP".sh
+
+# rename output files with a population tag
+for OUT in Output*; do mv $OUT "${OUT}_$POP"; done 
+
+```
+
+&nbsp;
+
+#### loop over all 4 populations
+```{bash, eval=FALSE}
+for FILE in `ls *.dat`; do POP=`ls $FILE | cut -f2 -d"."| cut -f5 -d"_"`; echo $FILE; echo $POP; sbatch ../../../scripts/colony.sbatch $FILE $POP; done 
+
+```
+
+&nbsp;
+
+## Colony results for multiple paternity
+**Table 2**
+Read Colony results into R
+```{r, message=FALSE, warning=FALSE}
+# load in bestConfig file of MOMS, DADS, and OFFSPRING
+bc.files2 <- list.files(path="~/Documents//crayfish_lab/jaredYseq2022/multPaternity", pattern='*.BestConfig', full.names = TRUE)
+
+bc.mdl.list <- list()
+for (FILE in bc.files2){
+  bc.df <- as.data.frame(fread(FILE))
+  pop <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(12)]
+  dfName <- paste( pop, 'df', sep = '.' )
+  tabName <- paste( pop, 'tab', sep = '.' )
+  bc.mdl.list[[dfName]] <- bc.df
+  
+  #bc.df$knownMom <- strsplit(sub('(^[^-]+-[^-]+)-(.*)$', '\\1 \\2', bc.df$OffspringID), ' ')
+  #bc.df$knownMom <- sapply(bc.df$knownMom, getElement, 1)
+  #bc.mdl.list[[tabName]] <- bc.df %>% group_by(FatherID) %>% count() # do you want this per mom? 
+  bc.df2 <- bc.df %>% mutate(MOM=OffspringID) %>% separate(MOM, into = c("mom1", "mom2", "J", "year"))  %>% mutate(knownMom=ifelse(is.na(year)==TRUE, paste0(mom1,"-", mom2), paste0(mom1, "-",mom2,"-", year))) %>% dplyr::select(OffspringID, FatherID, MotherID, ClusterIndex, knownMom)
+  bc.df3 <- bc.df2 %>% group_by(MotherID,FatherID) %>% count() 
+  bc.df3$Site <- pop
+  bc.mdl.list[[tabName]] <- bc.df3
+}
+
+bc.mdl.list$FC12.tab
+bc.mdl.list$FC16.tab
+bc.mdl.list$FC17b.tab
+bc.mdl.list$MB1.tab
+shd.mp <-bc.mdl.list$SHD.tab
+
+mp.all <- rbind(bc.mdl.list$FC12.tab, bc.mdl.list$FC16.tab, bc.mdl.list$FC17b.tab, bc.mdl.list$MB1.tab, bc.mdl.list$SHD.tab)
+
+
+mp.all.x <- mp.all %>% group_by(Site) %>% count(MotherID)
+mp.all.tab <- mp.all.x %>% group_by(Site) %>% summarise(mean=mean(n), stdv=sd(n))
+
+# rm FC12 bc only has one mom, and the unknown mom.....
+kt <- kruskal.test(n ~ Site, mp.all.x %>% filter(!Site=="FC12") %>% filter(!MotherID == "#1")) #p=0.052
+dt <- dunnTest(n ~ Site, mp.all.x %>% filter(!Site=="FC12") %>% filter(!MotherID == "#1")) 
+
+
+## add year to mom table
+mp.all.yr <- left_join(mp.all.x %>% mutate(SequenceID=MotherID), bf.off.males, by="SequenceID") %>% dplyr::select(Site.x, MotherID, n, Year)
+
+mp.all.x
+```
+
+&nbsp;
+
+## Plot pedigrees
+**Figure 5**
+
+&nbsp;
+
+Using Ellie Weise's code to make a pedigree like Fig 5 in Weise et al. 2022
+```{r, warning=FALSE, message=FALSE}
+source("~/Documents/crayfish_lab/pedigree.plot_ellieWeise_4multPat.R")
+
+
+ped.list <- c()
+for (DF in bc.mdl.list[grep("df", names(bc.mdl.list))]){
+  POP <- strsplit(DF[1,1], "-")[[1]][1]
+  
+  if (POP == "FC12") { renam <- "EastGC2" }
+  if (POP == "FC16") { renam <- "EastGC1" }
+  if (POP == "FC17b") { renam <- "EastGC4" }
+  if (POP == "MB1") { renam <- "WestGC1" }
+  if (POP == "SHD") { renam <- "Hotel1" }
+
+  pltName <- paste(renam)
+
+  pedigree.plot(DF, title=paste0(pltName, "\n"), cohortbox=F)
+  res = recordPlot()
+  plot.new()
+  ped.list[[pltName]] <- res
+}
+
+ped.list$EastGC1
+ped.list$EastGC2
+ped.list$EastGC4
+ped.list$WestGC1
+ped.list$Hotel1
+
+```
+
+&nbsp;
+
+# Does female carapace length correlate with number of inferred males
+
+&nbsp;
+
+## Plot number of inferred males versus berried female carapace length
+**Figure S3**
+```{r, warning=FALSE, message=FALSE}
+bc.mdl.all <- rbind(bc.mdl.list$FC12.tab,bc.mdl.list$FC16.tab,bc.mdl.list$FC17b.tab,bc.mdl.list$MB1.tab,bc.mdl.list$SHD.tab)
+
+# get number of inferred fathers and sample size of juveniles analyzed
+bc.mdl.grp <- bc.mdl.all %>% group_by(MotherID) %>% summarise(nInferredFathers=n(), nOffspring=sum(n), .groups = 'drop') 
+
+bc.mdl.grp <- bc.mdl.grp %>% mutate(SequenceID=MotherID)
+
+ohboy <- left_join(bc.mdl.grp, bfYoffYdad4colony, by="SequenceID")
+
+# Add carap length for the re-seq'd FC17b - fixed in Sample_database, but would need to re-make metadatafile to get the update
+ ohboy[ohboy$MotherID=="FC17b-M2-212", "Carap_mm"] <- 46.6
+ ohboy[ohboy$MotherID=="FC17b-M3-212", "Carap_mm"] <- 51.8
+ ohboy[ohboy$MotherID=="FC17b-M4-212", "Carap_mm"] <- 43.4
+ 
+# remove the 'unknown mom' from the one juv assigned to it
+ohboy <- ohboy %>% filter(!MotherID =="#1")
+
+# new abbrevs
+ohboy$newSite_Abbrev <- ifelse(ohboy$Site_Abbrev=="FC12", "EastGC2", "foo")
+ohboy$newSite_Abbrev <- ifelse(ohboy$Site_Abbrev=="FC16", "EastGC1", ohboy$newSite_Abbrev)
+ohboy$newSite_Abbrev <- ifelse(ohboy$Site_Abbrev=="FC17b", "EastGC4", ohboy$newSite_Abbrev)
+ohboy$newSite_Abbrev <- ifelse(ohboy$Site_Abbrev=="MB1", "WestGC1", ohboy$newSite_Abbrev)
+ohboy$newSite_Abbrev <- ifelse(ohboy$Site_Abbrev=="SHD", "Hotel1", ohboy$newSite_Abbrev)
+
+
+carap.p <- ggplot(ohboy %>% filter(!Site_Abbrev == "FC12"), aes(x=Carap_mm, y=nInferredFathers)) +
+  geom_point() +
+  #geom_smooth(method = "lm") +
+  stat_poly_line() +
+  stat_poly_eq(aes(label = after_stat(eq.label))) +
+  stat_poly_eq(label.y = 12) +
+  xlab("Berried female carapace length (mm)") +
+  ylab("Number of inferred fathers") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) +
+  facet_wrap(~newSite_Abbrev)
+
+#ggsave(carap.p, filename = "~/Documents/crayfish_lab/jaredYseq2022/multPaternity/carapVsMP_newAbbrevs_plot_4-15-2024.png", width = 11, height =8)
+
+carap.p
+```
+
+&nbsp;
+
+## Linear model testing for factors affecting inferred males
+```{r, warning=FALSE, message=FALSE}
+# since FC12 only has 1 mom and SHD-M14 only has 4 offspring, rm from dataset
+ohboy3 <- ohboy %>% filter(!Site_Abbrev=="FC12") %>% filter(!MotherID == "SHD-M14-20")
+
+
+# Add CPUE to data
+cpue <- read.csv("~/Documents/crayfish_lab/RSC_projectData/MonthlyCPUE_GeeMinnows_wAbbrevs.csv") 
+cpue <- cpue %>% rename(Site_Abbrev=site_abbrev)
+
+# Add cpue to dataframe
+ohboy3$Month <- c(9, 11, 9, 11, 10, NA, NA, NA, 11, 10, 10, 10, 10, 9, 10, 9, 9, 9, 9, 9)
+
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "FC16" & ohboy3$Year == 2021, unlist(cpue %>% filter(Site_Abbrev=="FC16" & Year==2020 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), "foo") 
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "FC17b" & ohboy3$Year == 2020, unlist(cpue %>% filter(Site_Abbrev=="FC17b" & Year==2020 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE) 
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "FC17b" & ohboy3$Year == 2021, unlist(cpue %>% filter(Site_Abbrev=="FC17b" & Year==2021 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE) 
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "MB1" & ohboy3$Year == 2020, unlist(cpue %>% filter(Site_Abbrev=="MB1" & Year==2020 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE) 
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "MB1" & ohboy3$Year == 2021, unlist(cpue %>% filter(Site_Abbrev=="MB1" & Year==2021 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE)
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "SHD" & ohboy3$Year == 2020, unlist(cpue %>% filter(Site_Abbrev=="SHD" & Year==2020 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE)
+ohboy3$AugCPUE <- ifelse(ohboy3$Site_Abbrev == "SHD" & ohboy3$Year == 2021, unlist(cpue %>% filter(Site_Abbrev=="SHD" & Year==2021 & Month==8) %>% dplyr::select(monthly_CPUE), use.names = F), ohboy3$AugCPUE)
+
+ohboy4 <- ohboy3 %>% mutate(AugCPUE=as.numeric(AugCPUE))
+
+```
+
+&nbsp;
+
+### Automated model testing
+**Table S5**
+```{r, warning=FALSE, message=FALSE}
+# Model testing with stepAIC removes any multicollinearity so put all variables in the model
+global.model <- glm(nInferredFathers ~ Carap_mm + nOffspring + as.factor(Site_Abbrev) + AugCPUE + as.factor(Year), data = ohboy4) # only interested in these vars
+
+variablesOfinterestxx <- c("Carap_mm", "nOffspring",  "AugCPUE", "Year") #"Site_Abbrev" isn't numeric
+varxx <- cor(ohboy4[,c(variablesOfinterestxx)])  # independent variables correlation matrix
+#corrplot(varxx, diag = FALSE, type = "lower", tl.col = 'black', addCoef.col = 'black')  
+
+step.model <- stepAIC(global.model, direction = "both")
+
+
+# see direction of Year and AugCPUE terms
+dads.vs.year.p <- ggplot(ohboy4, aes(x=as.factor(Year), y=nInferredFathers)) + geom_boxplot()
+dads.vs.cpue.p <- ggplot(ohboy4, aes(x=AugCPUE, y=nInferredFathers)) + geom_point() + geom_smooth(method = "lm")
+
+tidy(step.model)
+
+ggarrange(dads.vs.year.p, dads.vs.cpue.p)
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# Summary of data
+```{r, warning=FALSE, message=FALSE}
+dat.vcf <-  read.vcfR(file="~/Documents/crayfish_lab/jaredYseq2022/multPaternity/filteredSNPs_jY22_8-1_dp7miss75_hz.ab_imiss75_bfYoffYdad_maf03dp20.vcf") 
+
+dat.genind <- vcfR2genind(dat.vcf, sep = "[|/]") ## Create genind object # 899 individuals; 484 loci
+
+
+
+mp.vcf.files <- list.files(path="~/Documents/crayfish_lab/jaredYseq2022/multPaternity/", pattern = "*.1pTag.vcf", full.names = T)
+
+mp.vcf.list <- c()
+for (VCF in mp.vcf.files) {
+  genind.nam <- unlist(strsplit(VCF, "[/|,.,_]+"))[c(18)]
+  dat.vcf <-  read.vcfR(file= VCF)
+  dat.genind <- vcfR2genind(dat.vcf, sep = "[|/]")
+  mp.vcf.list[[genind.nam]] <- dat.genind
+}
+
+mp.vcf.list$FC12 # 77 individuals; 310 loci
+mp.vcf.list$FC16 # 162 individuals; 310 loci
+mp.vcf.list$FC17b # 157 individuals; 310 loci
+mp.vcf.list$MB1 # 272 individuals; 310 loci
+mp.vcf.list$SHD # 231 individuals; 310 loci
+ 
+```
