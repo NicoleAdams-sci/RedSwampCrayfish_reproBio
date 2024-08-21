@@ -1,0 +1,193 @@
+---
+title: "RSC_baitQuality_1-9-23"
+author: "Nicole Adams"
+date: '2023-01-09'
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+# Assess the quality of the Red Swamp Crayfish RAD capture baits
+Assess baits used for the 2021-2022 sequencing runs. Our approach is modeled after Seth Smith's [code](https://github.com/ScribnerLab/SeaLampreyRapture/tree/master/analysis)
+and the accompanying [paper](https://onlinelibrary.wiley.com/doi/full/10.1002/ece3.6001)
+
+&nbsp;
+
+## Map baits to reference
+Map baits fasta file to new *P. clarkii* reference genome (/mnt/home/adamsn23/RedSwampCrayfish/scripts/mapBaits.sbatch)
+```{bash, eval=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=36G
+#SBATCH -J mapBaits
+#SBATCH -o mapBaits.%j.o
+#SBATCH --error mapBaits.%j.err
+
+module purge
+module load GCC/6.4.0-2.28 OpenMPI/2.1.1 BWA/0.7.17 SAMtools/1.9
+
+RUN_PATH=/mnt/home/adamsn23/RedSwampCrayfish/reference
+SCR=/mnt/gs21/scratch/adamsn23/RSC/seq2022
+
+bwa mem GCF_020424385.1_ASM2042438v2_genomic.fna RSC_baits.fasta -t 8 | samtools view -Sb - > RSC_baits.bam
+
+```
+
+&nbsp;
+
+### Convert baits BAM file to BED file
+```{bash, eval=FALSE}
+module load GCC/8.3.0  OpenMPI/3.1.4 pybedtools/0.8.1
+bedtools bamtobed -i RSC_baits.bam > RSC_baits_mapd.bed
+
+cat RSC_baits_mapd.bed |wc -l # 7,128
+cat RSC_baits.fasta | grep ">" | wc -l # 7,660
+
+```
+
+&nbsp;
+
+### Look at on-target metrics after genotyping
+```{bash, eval=FALSE}
+module load GCC/7.3.0-2.30 OpenMPI/3.1.1 VCFtools/0.1.15-Perl-5.28.0
+
+cd /mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/OUT/genotyped/
+
+# take the first jY22 genotyped file
+ populations.snps.vcf
+
+# Filter for just repro bio samples
+cp OUT/genotyped/multPaternity/jY22_bfYoffYdad4colony.txt SHELL/dependencies/
+cd /mnt/home/adamsn23/RedSwampCrayfish/jaredYseq2022/SHELL/dependencies
+
+cat juvs_jY22.txt > jY22_reproBio.txt
+cat jY22_bfYoffYdad4colony.txt >> jY22_reproBio.txt #N=2008
+
+#(scripts/filterVCFs.sbatch)
+vcftools --vcf populations.snps.vcf --keep ../../SHELL/dependencies/jY22_reproBio.txt --recode --recode-INFO-all --out jY22_reproBio
+
+#kept 1974 out of 3411 Individuals; kept 1001598 out of a possible 1001598 Sites
+
+```
+
+&nbsp;
+
+### Run bedtools intersect
+Count number of baits that mapped
+```{bash, eval=FALSE}
+# Sort files so they take up less memory with bedtools intersect
+#module load GCC/10.2.0 HTSlib/1.12
+bgzip -c jY22_reproBio.recode.vcf > jY22_reproBio.recode.vcf.gz
+
+# 0) sort bait bed and VCF file (or else get OOM error)
+sort -k1,1V -k2,2n ../../../reference/RSC_baits_mapd.bed > ../../../reference/RSC_baits_mapd.sorted.bed
+
+
+# 1) sort VCF (or else get OOM error from bedtools intersect)
+module load picard/2.25.0-Java-11 
+java -jar $EBROOTPICARD/picard.jar SortVcf \
+I=jY22_reproBio.recode.vcf \
+O=jY22_reproBio.recode.sortX.vcf \
+R=../../../reference/GCF_020424385.1_ASM2042438v2_genomic.fna.gz \
+SD=../../../reference/GCF_020424385.1_ASM2042438v2_genomic.fna.dict
+TMP_DIR=$SCRATCH/RSC/seq2022/ \
+MAX_RECORDS_IN_RAM=1000   #NEED this or else it OOM
+
+
+# 2) bedtools intersect
+module load BEDTools
+REF="/mnt/home/adamsn23/RedSwampCrayfish/reference"
+bedtools intersect -a $REF/RSC_baits_mapd.sorted.bed -b jY22_reproBio.recode.sortX.vcf -sorted > onTarget/jY22_reproBio.sortX.intersect
+
+
+# 3) count baits that mapped
+less jY22_reproBio.sortX.intersect |wc -l # 37,638 just has bed info
+less jY22_reproBio.sortX.intersect.wo |wc -l # 37,638 also has SNP info/ bait info
+
+
+awk '{ print $4 }' jY22_reproBio.sortX.intersect | sort | uniq | wc -l # 6642
+
+awk '{ print $4 }' jY22_reproBio.sortX.intersect.wo | sort | uniq | wc -l # 6642
+
+6642/7128 # 93% mapped baits
+6642/7660 # 87% total baits
+```
+
+7,128 baits (93%) mapped to the *P. clarkii* genome. We recovered genotypes from 6,642 (93%) of the 7,128 mapped baits and 87% of the 7,660 total baits.
+
+&nbsp;
+&nbsp;
+
+### Load in R libraries
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggpubr)
+```
+
+&nbsp;
+
+# Bait chromosome plots
+**Figure S1A**
+```{r, warning=FALSE, message=FALSE}
+#BiocManager::install("quantsmooth")
+library(quantsmooth)
+
+baits <- as.data.frame(read.delim("~/Documents/crayfish_lab/RSC_baits/RSC_baits_mapd.bed", header = F))
+
+colnames(baits) <- c("Chrom", "Start", "End", "Name", "Score", "Strand")
+
+# rename chromosomes...
+rsc.chr <- read.csv("~/Documents/crayfish_lab/RSC_baits/RSC_refGenome_Chroms.csv")
+rsc.chr$CHR <- as.numeric(rownames(rsc.chr))
+rsc.chr$Chrom <- rsc.chr$RefSeq
+rsc.chr$Size..bp. <- as.numeric(gsub(",", "", rsc.chr$Size..bp.))
+
+baits2 <- left_join(baits, rsc.chr, by="Chrom")
+
+baits3 <- baits2 %>% dplyr::select(CHR, Start) %>% rename("MapInfo"="Start")
+
+#jpeg(file="~/Documents/crayfish_lab/RSC_baits/baitMap_1-22-23.jpeg", width=8.5, height=12, units="in", res=200 )
+chrompos <- prepareGenomePlot(baits3, cols = "grey50", paintCytobands = TRUE, bleach = 0, topspace = 0.01, cex = 0.5, sexChromosomes = FALSE)
+points(chrompos[,2],chrompos[,1]+0.05,pch="|", cex = 0.75, col="deepskyblue4") #change to a red?
+#dev.off()
+
+```
+
+&nbsp;
+
+# Target density plot
+**Figure S1B**
+```{r, warning=FALSE, message=FALSE}
+# for the 94 chromosomes bc that's what I have chr size data for...
+
+target1 <- baits2 %>% group_by(Chrom) %>% count() 
+target2 <- left_join(target1, rsc.chr)
+target3 <- subset(target2, Size..bp. > 10000000)
+
+target3$density <- target3$n/(target3$Size..bp./1000000) # take number of targets per chrom and divde by the size of the chrom in mega bases
+
+mn <- mean(target3$density)
+sd <- sd(target3$density)
+
+target.p <- ggplot(target3, aes(x=density)) +
+  geom_histogram(fill="lightgray", color = "black", binwidth = 0.25, alpha=0.6) +
+  xlim(c(-1,10)) +
+  geom_vline(xintercept = mn, linetype = "dashed") +
+  xlab("Mean Number of Target RAD Loci Per Megabase") + ylab("Scaffold Count") +
+  theme_minimal() +
+  theme(legend.position="none",
+        text = element_text(size=16),
+        axis.text.x = element_text(angle=0, hjust=1))
+
+#ggsave(target.p, file="~/Documents/crayfish_lab/RSC_baits/targetDensityPlot_1-18-23.png")
+
+target.pB <- ggarrange(target.p, labels = "B", font.label = list(size = 18))
+
+#ggsave(target.pB, file="~/Documents/crayfish_lab/RSC_baits/targetDensityPlot_1-26-23.png")
+
+target.pB
+```
