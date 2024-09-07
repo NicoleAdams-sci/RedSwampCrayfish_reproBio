@@ -924,11 +924,16 @@ for (DF in bc.mdl.list[grep("df", names(bc.mdl.list))]){
   ped.list[[pltName]] <- res
 }
 
+
+# combine plots
+#png("~/Documents/crayfish_lab/jaredYseq2022/multPaternity/Adams_SF5_mpPedigrees_9-7-24.png", width = 11, height = 8, units='in', res = 1000)
+par(mfrow = c(2, 3))
 ped.list$EastGC1
 ped.list$EastGC2
 ped.list$EastGC4
 ped.list$WestGC1
 ped.list$Hotel1
+#dev.off()
 
 ```
 
