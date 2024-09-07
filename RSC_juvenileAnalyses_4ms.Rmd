@@ -1488,18 +1488,19 @@ for (FILE in bc.files){
 }
 
 
-pedigree.plot(bc.ped.list$FC12.df, title="EastGC2", cohortbox=F)
-pedigree.plot(bc.ped.list$FC17b.df, title="EastGC4", cohortbox=F)
-pedigree.plot(bc.ped.list$MB1.df, title="WestGC1", cohortbox=F)
-pedigree.plot(bc.ped.list$SHDco1.df, title="Hotel1_co1", cohortbox=F)
-pedigree.plot(bc.ped.list$SHDco2.df, title="Hotel1_co2", cohortbox=F)
-
 # do SHD cohorts combined
 # add cohort column to df
 bc.ped.list$SHDcom.df$cohort <- ifelse(bc.ped.list$SHDcom.df$OffspringID %in% bc.ped.list$SHDco1.df$OffspringID, "cohort 1", "cohort 2")
 
-pedigree.plot(bc.ped.list$SHDcom.df, title="Hotel1_com", cohortbox=T) #save manually
-
+#png("~/Documents/crayfish_lab/jaredYseq2022/juvs/Adams_F3_juvPedigrees_9-7-24.png", width = 8, height = 11, units='in', res = 1000)
+par(mfrow = c(2, 2))
+pedigree.plot(bc.ped.list$FC12.df, title="EastGC2", cohortbox=F)
+pedigree.plot(bc.ped.list$FC17b.df, title="EastGC4", cohortbox=F)
+pedigree.plot(bc.ped.list$MB1.df, title="WestGC1", cohortbox=F)
+pedigree.plot(bc.ped.list$SHDcom.df, title="Hotel1_com", cohortbox=T)
+points(x=c(1,1,1,1,1,1), y=c(75.5,100.5,119,131.5,137.5,144), pch=5, col="darkred")
+points(x=c(3,3,3,3), y=c(24,30,41.5,53), pch=5, col="darkred")
+#dev.off()
 ```
 
 &nbsp;
