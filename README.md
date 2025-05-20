@@ -1,4 +1,5 @@
 # RedSwampCrayfish_reproBio
+[![DOI](https://zenodo.org/badge/844214329.svg)](https://doi.org/10.5281/zenodo.15476232)
 
 This repo is for the manuscript Adams NE, Homola JJ, Sard NM, Nathan LR, Roth BM, Robinson JD, Scribner KT. 2024. Genomic data 
 characterize 
